@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ee-req-pipeline"
+version = "1.0.0"
+description = "Automotive E/E requirements extraction pipeline with ChatT API"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "pydantic>=2.0",
+    "typer>=0.9",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+    "python-docx>=0.8",
+    "python-pptx>=0.6",
+    "pymupdf>=1.23",
+    "pyyaml>=6.0",
+        "python-dotenv>=1.0",
+    "httpx>=0.24",
+    "tenacity>=8.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+ee-pipeline = "ee_pipeline.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["B008", "E501", "F821"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ee_pipeline"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
