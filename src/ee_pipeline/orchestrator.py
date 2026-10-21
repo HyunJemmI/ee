@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -14,6 +15,11 @@ def run_pipeline(config: PipelineConfig | None = None) -> dict:
 
     Returns a summary dict with statistics.
     """
+    return asyncio.run(_run_pipeline(config))
+
+
+async def _run_pipeline(config: PipelineConfig | None = None) -> dict:
+    """Async implementation of the full pipeline."""
     if config is None:
         config = PipelineConfig()
 
@@ -45,11 +51,11 @@ def run_pipeline(config: PipelineConfig | None = None) -> dict:
 
     # ---- M5: AI Classifier (ChatT) ----
     from .modules.module5_classifier import run as m5_run
-    classifications = m5_run(config, segments)
+    classifications = await m5_run(config, segments)
 
     # ---- M6: Translate & Validate (ChatT) ----
     from .modules.module6_translate import run as m6_run
-    translations = m6_run(config, classifications)
+    translations = await m6_run(config, classifications)
 
     # ---- M7: Aggregator ----
     from .modules.module7_aggregator import run as m7_run

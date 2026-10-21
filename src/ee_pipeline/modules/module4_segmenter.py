@@ -12,6 +12,7 @@ Features:
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -20,34 +21,51 @@ from ..models import DocumentBlock
 
 
 # ---------------------------------------------------------------------------
-# Metadata filtering patterns
+# Metadata scoring system
 # ---------------------------------------------------------------------------
 
-# Strong metadata regex patterns (high-confidence skip candidates)
-METADATA_PATTERNS = [
-    r"^\d{1,3}$",  # Page number
-    r"^v\d+\.\d+$",  # Version number
-    r"^Rev\.\s*\d+\.\d+$",  # Revision
-    r"^CONFIDENTIAL$",  # Confidential
-    r"^DISTRIBUTION:",  # Distribution info
-    r"^TABLE OF CONTENTS$",  # TOC
-    r"^REVISION HISTORY$",  # Revision history
-    r"^DEFINITIONS$",  # Definitions
-    r"^ABBREVIATIONS$",  # Abbreviations
-    r"^REFERENCES$",  # References
-    r"^COPYRIGHT",  # Copyright
-    r"^ALL RIGHTS RESERVED",  # Rights reserved
-    r"^PROPERTY OF",  # Property notice
-]
+# Scoring thresholds
+SKIP_THRESHOLD = 5          # Score >= this -> skip_candidate
+BLOCKING_THRESHOLD = 0      # Any blocking signal -> no skip regardless of score
 
-# Requirement signal keywords (any match = keep for M5)
-REQUIREMENT_SIGNALS = [
+# Blocking signals -- if ANY match, the segment MUST NOT be skipped
+BLOCKING_SIGNALS = [
     r"\bshall\b", r"\bmust\b", r"\brequired\b", r"\bneed to\b",
     r"\bcomply\b", r"\bverify\b", r"\btest\b", r"\bacceptance\b",
     r"\btolerance\b", r"\bvalidation\b", r"\bapproval\b",
-    r"\b승인\b", r"\b요구\b", r"\b시험\b", r"\b검증\b",
-    r"\b기준\b", r"\b허용\b", r"\b금지\b",
+    r"\b\ub3c4\uad6c\b", r"\b\uc2dc\ud5d8\b", r"\b\uac80\uc99d\b",
+    r"\b\uae30\uc900\b", r"\b\ud5c8\uc6a9\b", r"\b\uae40\uc9c0\b",
+    r"\b\uacf5\ucc2c\b", r"\b\ud310\uc815\b", r"\b\uc218\uce58\b",
 ]
+
+# Scoring patterns -- each adds points toward skip
+# (+) = adds to metadata_score
+# (-) = subtracts from metadata_score
+_METADATA_SCORE_RULES = [
+    # (+3) Page number only
+    (r"^\d{1,3}$", 3, "page_number_only"),
+    # (+2) Standard document header
+    (r"^(TABLE OF CONTENTS|REVISION HISTORY|DEFINITIONS|ABBREVIATIONS|REFERENCES|CONTENTS)$", 2, "standard_header"),
+    # (+2) Regulation/standard label
+    (r"^(ISO|IEC|SAE|JIS|DIN|ANSI|ECE|UN)\s*\d+[\.\-]?\w*$", 2, "regulation_label"),
+    # (+2) Repeated copyright/confidential
+    (r"^(COPYRIGHT|CONFIDENTIAL|ALL RIGHTS RESERVED|PROPERTY OF|DISTRIBUTION:)", 2, "copyright_confidential"),
+    # (+2) Version/revision marker
+    (r"^(v\d+[\.\d]*|Rev\.\s*\d+[\.\d]*)$", 2, "version_marker"),
+    # (+1) Boundary position (first/last segment of document)
+    (r"^(Page|PAGE|p\.|p\. )\s*\d+", 1, "page_boundary"),
+    # (+1) Very short text
+    (r"^.{1,20}$", 1, "very_short"),
+    # (-5) Requirement signal present
+    (r"\bshall\b|\bmust\b|\brequired\b|\bneed to\b|\bcomply\b|\bverify\b|\btest\b|\bacceptance\b|\btolerance\b|\bvalidation\b|\bapproval\b|\b\ub3c4\uad6c\b|\b\uc2dc\ud5d8\b|\b\uac80\uc99d\b|\b\uae30\uc900\b|\b\ud5c8\uc6a9\b|\b\uae40\uc9c0\b|\b\uacf5\ucc2c\b|\b\ud310\uc815\b|\b\uc218\uce58\b", -5, "requirement_signal"),
+    # (-5) Test/judgment/numeric criteria
+    (r"(\uc2dc\ud5d8|\ud310\uc815|\ud5c8\uc6a9|\uacf5\ucc2c|\uae30\uc900|\uc218\uce58|\uac80\uc0ac|\ucc4c\uc815|\ud3b0\uac00|\u5224\u5b9a|\u8a66\u9a13|\u57fa\u6e96|\u8a31\u5bb9|\u516c\u5dee)", -5, "test_criteria"),
+    # (-4) Table context
+    (r"^\|.*\|$", -4, "table_row"),
+    # (-3) Technical heading context
+    (r"^(3\.\d+|4\.\d+|5\.\d+|6\.\d+|7\.\d+|8\.\d+|9\.\d+)\s+[A-Z]", -3, "technical_heading"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Merge configuration
@@ -57,39 +75,68 @@ MERGE_THRESHOLD = 500        # Short segment threshold (chars)
 MERGE_TARGET_MIN = 1200      # Target merged size (chars)
 MERGE_TARGET_MAX = 2000      # Max merged size (chars)
 
+# Requirement signal keywords (any match = keep for M5) -- kept for backward compatibility
+REQUIREMENT_SIGNALS = [
+    r"\bshall\b", r"\bmust\b", r"\brequired\b", r"\bneed to\b",
+    r"\bcomply\b", r"\bverify\b", r"\btest\b", r"\bacceptance\b",
+    r"\btolerance\b", r"\bvalidation\b", r"\bapproval\b",
+    r"\b\ub3c4\uad6c\b", r"\b\uc2dc\ud5d8\b", r"\b\uac80\uc99d\b",
+    r"\b\uae30\uc900\b", r"\b\ud5c8\uc6a9\b", r"\b\uae40\uc9c0\b",
+]
+
 
 # ---------------------------------------------------------------------------
-# Metadata detection
+# Metadata detection helpers
 # ---------------------------------------------------------------------------
 
-def _is_metadata_segment(segment: dict) -> tuple[bool, str]:
-    """Check if a segment is likely metadata that can be safely skipped.
+def _has_blocking_signal(content: str) -> bool:
+    """Check if content contains any blocking signal (must NOT skip)."""
+    for sig in BLOCKING_SIGNALS:
+        if re.search(sig, content, re.IGNORECASE):
+            return True
+    return False
 
-    Conservative criteria — only skip if ALL conditions are met:
-    1. Very short text (< 50 chars)
-    2. No requirement signals
-    3. Matches strong metadata pattern
+
+def _compute_metadata_score(content: str) -> tuple[int, str]:
+    """Compute a metadata score for a segment.
 
     Returns:
-        (is_metadata, skip_reason)
+        (score, reason) -- score >= SKIP_THRESHOLD means skip_candidate
     """
-    content = segment.get("content", "").strip()
+    content = content.strip()
+    if not content:
+        return 10, "empty_content"  # Empty is always metadata
 
-    # Condition 1: Very short text
-    if len(content) < 50:
-        # Condition 2: No requirement signals
-        has_requirement_signal = any(
-            re.search(sig, content, re.IGNORECASE)
-            for sig in REQUIREMENT_SIGNALS
-        )
+    # Blocking check -- if any blocking signal found, return immediately
+    if _has_blocking_signal(content):
+        return -100, "blocking_signal"
 
-        if not has_requirement_signal:
-            # Condition 3: Match metadata pattern
-            for pattern in METADATA_PATTERNS:
-                if re.match(pattern, content, re.IGNORECASE):
-                    return True, f"metadata_pattern: {pattern}"
+    score = 0
+    reasons = []
 
-    return False, ""
+    for pattern, points, label in _METADATA_SCORE_RULES:
+        if re.search(pattern, content, re.IGNORECASE):
+            score += points
+            reasons.append(f"{label}(+{points})")
+
+    reason = "; ".join(reasons) if reasons else "no_match"
+    return score, reason
+
+
+def _is_metadata_segment(segment: dict) -> tuple[bool, str | None]:
+    """Determine if a segment is metadata (should be skipped).
+
+    Uses blocking signals and metadata scoring to decide.
+    Returns (is_metadata, skip_reason).
+    """
+    content = segment.get("content", "")
+    if _has_blocking_signal(content):
+        return False, None
+
+    score, reason = _compute_metadata_score(content)
+    if score >= SKIP_THRESHOLD:
+        return True, reason
+    return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -193,15 +240,20 @@ def _merge_short_segments(segments: list[dict]) -> list[dict]:
         seg_length = len(seg_content)
         is_skip = seg.get("skip_candidate", False)
 
-        # Check document boundary — start new batch
-        if current_doc_id is not None and seg_doc_id != current_doc_id:
+        # Initialize current_doc_id from first segment
+        if current_doc_id is None:
+            current_doc_id = seg_doc_id
+            current_heading = seg_heading
+
+        # Check document boundary -- start new batch
+        if seg_doc_id != current_doc_id:
             if current_batch:
                 batches.append(_build_batch(current_batch, current_doc_id))
                 current_batch = []
             current_doc_id = seg_doc_id
             current_heading = seg_heading
 
-        # Check heading/topic boundary — start new batch if major shift
+        # Check heading/topic boundary -- start new batch if major shift
         if (current_batch and
             current_heading is not None and
             seg_heading is not None and
@@ -216,7 +268,7 @@ def _merge_short_segments(segments: list[dict]) -> list[dict]:
                 current_batch = []
                 current_heading = seg_heading
 
-        # Handle skip_candidate segments — keep separate, don't merge into content
+        # Handle skip_candidate segments -- keep separate, don't merge into content
         if is_skip:
             if current_batch:
                 batches.append(_build_batch(current_batch, current_doc_id))
@@ -235,10 +287,10 @@ def _merge_short_segments(segments: list[dict]) -> list[dict]:
             current_batch.append(seg)
             current_heading = seg_heading
         elif seg_length <= MERGE_THRESHOLD and (current_content_len + seg_length) <= MERGE_TARGET_MAX:
-            # Short segment + fits in target → merge
+            # Short segment + fits in target -> merge
             current_batch.append(seg)
         elif current_content_len >= MERGE_TARGET_MIN:
-            # Current batch is large enough → flush and start new
+            # Current batch is large enough -> flush and start new
             batches.append(_build_batch(current_batch, current_doc_id))
             current_batch = [seg]
             current_heading = seg_heading
@@ -355,7 +407,26 @@ def segment_chunks(chunks: list) -> list[dict]:
     all_segments: list[dict] = []
 
     for chunk in chunks:
-        if hasattr(chunk, 'combined_content'):
+        # Check if chunk is a dict (from JSONL) or object (from pipeline)
+        if isinstance(chunk, dict):
+            content = chunk.get("combined_content", "")
+            heading = chunk.get("heading_hierarchy", "")
+            # Extract document_id from blocks (dict format)
+            doc_id = ""
+            if chunk.get("blocks"):
+                first_block = chunk["blocks"][0]
+                if isinstance(first_block, dict):
+                    doc_id = first_block.get("doc_id", "")
+                else:
+                    doc_id = getattr(first_block, "doc_id", "")
+            chunk_provenance = {
+                "document_id": doc_id,
+                "heading_index": chunk.get("heading_index"),
+                "heading_text": chunk.get("heading_text"),
+                "source_line_ranges": chunk.get("source_line_ranges", []),
+                "parent_heading": heading,
+            }
+        elif hasattr(chunk, 'combined_content'):
             content = chunk.combined_content
             heading = chunk.heading_hierarchy
             chunk_provenance = {
@@ -366,15 +437,7 @@ def segment_chunks(chunks: list) -> list[dict]:
                 "parent_heading": heading,
             }
         else:
-            content = chunk.get("combined_content", "")
-            heading = chunk.get("heading_hierarchy", "")
-            chunk_provenance = {
-                "document_id": chunk.get("document_id", ""),
-                "heading_index": chunk.get("heading_index"),
-                "heading_text": chunk.get("heading_text"),
-                "source_line_ranges": chunk.get("source_line_ranges", []),
-                "parent_heading": heading,
-            }
+            continue
 
         segments = _split_into_segments(content, heading, chunk_provenance)
         all_segments.extend(segments)
@@ -402,10 +465,10 @@ def run(config: PipelineConfig, chunks: list[dict]) -> list[dict]:
     batches_path = config.run_dir / "requirement_batches.jsonl"
     with open(batches_path, "w", encoding="utf-8") as f:
         for batch in batches:
-            f.write(batch["merged_text"] + "\n")
+            f.write(json.dumps(batch, ensure_ascii=False) + "\n")
 
-    print(f"[M4] {len(chunks)} chunks → {total_source_segments} source segments → {len(batches)} batches")
-    print(f"     → {processed_batches} to process | {skip_batches} skip_candidate")
-    print(f"     → avg merged size: {total_merged_chars // max(len(batches), 1)} chars")
-    print(f"     → {batches_path}")
+    print(f"[M4] {len(chunks)} chunks -> {total_source_segments} source segments -> {len(batches)} batches")
+    print(f"     -> {processed_batches} to process | {skip_batches} skip_candidate")
+    print(f"     -> avg merged size: {total_merged_chars // max(len(batches), 1)} chars")
+    print(f"     -> {batches_path}")
     return batches

@@ -98,7 +98,7 @@ class PipelineConfig:
     chatt_model: str = CHATT_MODEL
     keywords: dict = field(default_factory=load_keywords)
     # Minimum keywords to consider a file as EE-related
-    min_primary_keywords: int = 1
+    min_primary_keywords: int = 5
     # Confidence threshold for AI prescreening
     ai_confidence_threshold: float = 0.7
 

@@ -1,4 +1,4 @@
-"""M8: XLSX Report Generator — generates the final output report.
+﻿"""M8: XLSX Report Generator — generates the final output report.
 
 Creates an Excel file matching the template structure from the reference xlsx:
 - Sheet 1: 문서분류 (Document Classification)
@@ -275,10 +275,10 @@ def generate_report(
     _write_review_procedure(ws4)
 
     # Save with timestamp to preserve previous reports
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = config.run_dir / f"final_report_{timestamp}.xlsx"
-        wb.save(report_path)
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = config.run_dir / f"final_report_{timestamp}.xlsx"
+    wb.save(report_path)
 
     print(f"[M8] Report generated → {report_path}")
     return report_path

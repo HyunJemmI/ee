@@ -1,4 +1,4 @@
-﻿"""M5: AI Classifier — 2-axis classification via ChatT API.
+"""M5: AI Classifier — 2-axis classification via ChatT API.
 
 Classifies each requirement candidate on two axes:
 1. is_requirement — Is this a requirement statement?
@@ -22,6 +22,7 @@ import asyncio
 import json
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,67 +31,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import CHATT_API_KEY, CHATT_BASE_URL, CHATT_MODEL, PipelineConfig
 from ..models import ClassificationResult, EECategory
-
-
-# ---------------------------------------------------------------------------
-# Metadata filtering patterns
-# ---------------------------------------------------------------------------
-
-# Strong metadata regex patterns (high-confidence skip candidates)
-METADATA_PATTERNS = [
-    r"^\d{1,3}$",  # Page number
-    r"^v\d+\.\d+$",  # Version number
-    r"^Rev\.\s*\d+\.\d+$",  # Revision
-    r"^CONFIDENTIAL$",  # Confidential
-    r"^DISTRIBUTION:",  # Distribution info
-    r"^TABLE OF CONTENTS$",  # TOC
-    r"^REVISION HISTORY$",  # Revision history
-    r"^DEFINITIONS$",  # Definitions
-    r"^ABBREVIATIONS$",  # Abbreviations
-    r"^REFERENCES$",  # References
-    r"^COPYRIGHT",  # Copyright
-    r"^ALL RIGHTS RESERVED",  # Rights reserved
-    r"^PROPERTY OF",  # Property notice
-]
-
-# Requirement signal keywords (any match = keep for M5)
-REQUIREMENT_SIGNALS = [
-    r"\bshall\b", r"\bmust\b", r"\brequired\b", r"\bneed to\b",
-    r"\bcomply\b", r"\bverify\b", r"\btest\b", r"\bacceptance\b",
-    r"\btolerance\b", r"\bvalidation\b", r"\bapproval\b",
-    r"\b승인\b", r"\b요구\b", r"\b시험\b", r"\b검증\b",
-    r"\b기준\b", r"\b허용\b", r"\b금지\b",
-]
-
-
-def _is_metadata_segment(segment: dict) -> tuple[bool, str]:
-    """Check if a segment is likely metadata that can be safely skipped.
-
-    Conservative criteria — only skip if ALL conditions are met:
-    1. Very short text (< 50 chars)
-    2. No requirement signals
-    3. Matches strong metadata pattern
-
-    Returns:
-        (is_metadata, skip_reason)
-    """
-    content = segment.get("content", "").strip()
-
-    # Condition 1: Very short text
-    if len(content) < 50:
-        # Condition 2: No requirement signals
-        has_requirement_signal = any(
-            re.search(sig, content, re.IGNORECASE)
-            for sig in REQUIREMENT_SIGNALS
-        )
-
-        if not has_requirement_signal:
-            # Condition 3: Match metadata pattern
-            for pattern in METADATA_PATTERNS:
-                if re.match(pattern, content, re.IGNORECASE):
-                    return True, f"metadata_pattern: {pattern}"
-
-    return False, ""
 
 
 def _build_classification_payload(text: str, heading: str | None = None) -> dict:
@@ -234,7 +174,7 @@ async def _classify_with_retry(
 
 async def classify_batch_parallel(
     batches: list[dict],
-    max_concurrency: int = 4,
+    max_concurrency: int = 8,
 ) -> list[ClassificationResult]:
     """Classify merged batches in parallel with bounded concurrency.
 
@@ -329,95 +269,7 @@ async def classify_batch_parallel(
     return results
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def classify_batch(segments: list[dict]) -> list[ClassificationResult]:
-    """Classify a batch of segments via ChatT API (sequential, for compatibility).
-
-    Args:
-        segments: List of segment dicts with 'content' and optional 'heading'.
-
-    Returns:
-        List of ClassificationResult objects.
-    """
-    results: list[ClassificationResult] = []
-
-    for i, seg in enumerate(segments):
-        text = seg.get("content", "")
-        heading = seg.get("heading")
-
-        print(f"[M5] Classifying segment {i+1}/{len(segments)}...")
-
-        try:
-            llm_output = _classify_single(text, heading)
-
-            if "error" in llm_output:
-                print(f"       ERROR: {llm_output['error']}")
-                continue
-
-            # Parse ee_category
-            ee_cat_str = llm_output.get("ee_category", "Other")
-            try:
-                ee_category = EECategory(ee_cat_str)
-            except ValueError:
-                ee_category = EECategory.OTHER
-
-            result = ClassificationResult(
-                block_id=f"seg_{i+1:03d}",
-                doc_id=seg.get("doc_id", "unknown"),
-                is_requirement=llm_output.get("is_requirement", False),
-                is_ee_related=llm_output.get("is_ee_related", False),
-                ee_category=ee_category,
-                reasoning=llm_output.get("reasoning", ""),
-                original_content=text,
-            )
-            results.append(result)
-
-            # Summary
-            req_str = "REQ" if result.is_requirement else "non-REQ"
-            ee_str = "EE" if result.is_ee_related else "non-EE"
-            print(f"       → {req_str} / {ee_str} | {ee_category.value}")
-
-        except Exception as e:
-            print(f"       FAILED: {e}")
-            results.append(ClassificationResult(
-                block_id=f"seg_{i+1:03d}",
-                doc_id=seg.get("doc_id", "unknown"),
-                is_requirement=False,
-                is_ee_related=False,
-                reasoning=f"API error: {e}",
-                original_content=text,
-            ))
-
-    return results
-
-
-def _classify_single(text: str, heading: str | None = None) -> dict[str, Any]:
-    """Call ChatT API for a single classification (sync version)."""
-    payload = _build_classification_payload(text, heading)
-
-    url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {CHATT_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError("No choices in LLM response")
-
-    content = choices[0].get("message", {}).get("content")
-    if content is None:
-        raise ValueError("LLM returned None content")
-    return _parse_llm_response(content)
-
-
-def run(config: PipelineConfig, batches: list[dict]) -> list[ClassificationResult]:
+async def run(config: PipelineConfig, batches: list[dict]) -> list[ClassificationResult]:
     """Execute M5: classify all merged batches via ChatT API.
 
     Uses parallel processing with bounded concurrency and metadata filtering.
@@ -426,10 +278,9 @@ def run(config: PipelineConfig, batches: list[dict]) -> list[ClassificationResul
     Args:
         batches: List of batch dicts from M4 (each with merged_text, source_segments, etc.)
     """
-    import time as _time
-    t0 = _time.time()
-    results = classify_batch_parallel(batches, max_concurrency=4)
-    m5_elapsed = _time.time() - t0
+    t0 = time.time()
+    results = await classify_batch_parallel(batches, max_concurrency=8)
+    m5_elapsed = time.time() - t0
 
     classifications_path = config.run_dir / "classifications.jsonl"
     with open(classifications_path, "w", encoding="utf-8") as f:

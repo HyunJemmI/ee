@@ -85,7 +85,7 @@ async def _translate_with_retry(text: str, max_retries: int = 3) -> tuple[str, b
 
 async def translate_batch_parallel(
     classifications: list[ClassificationResult],
-    max_concurrency: int = 4,
+    max_concurrency: int = 8,
 ) -> list[TranslationResult]:
     """Translate EE-related requirement statements in parallel.
 
@@ -223,7 +223,7 @@ def _translate_single(text: str) -> str:
     return content.strip()
 
 
-def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> list[TranslationResult]:
+async def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> list[TranslationResult]:
     """Execute M6: translate EE requirements.
 
     Uses parallel processing with bounded concurrency.
@@ -232,7 +232,7 @@ def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> 
     """
     import time as _time
     t0 = _time.time()
-    results = translate_batch_parallel(classifications, max_concurrency=4)
+    results = await translate_batch_parallel(classifications, max_concurrency=8)
     m6_elapsed = _time.time() - t0
 
     translated_path = config.run_dir / "translated.jsonl"
