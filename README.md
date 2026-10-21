@@ -130,6 +130,7 @@ EE-req/
 
 ## 구현 및 검증 문서
 
+- [회사 환경 LLM 인수인계 프롬프트](LLM_HANDOFF_INSTRUCTIONS.md)
 - [최종 구현 요약](PROJECT_FINAL_REPORT.md)
 - [M1~M4.5 개선 보고서](m2_m4_improvement_report.md)
 - [M2~M4 closed-loop 검증](m2_m4_closed_loop_report.md)
