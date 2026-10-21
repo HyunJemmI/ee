@@ -1,4 +1,4 @@
-"""Pipeline orchestrator — chains all modules together."""
+﻿"""Pipeline orchestrator — chains all modules together."""
 
 from __future__ import annotations
 
@@ -53,7 +53,21 @@ def run_pipeline(config: PipelineConfig | None = None) -> dict:
 
     # ---- M7: Aggregator ----
     from .modules.module7_aggregator import run as m7_run
-    spec_records = m7_run(config, classifications, translations)
+    # Build provenance map from M4 batches' source_segments for M7
+    provenance_map = {}
+    for batch in segments:  # segments = M4 batches
+        for src_seg in batch.get("source_segments", []):
+            seg_id = src_seg.get("segment_id", "")
+            if seg_id:
+                provenance_map[seg_id] = {
+                    "heading": src_seg.get("heading_text"),
+                    "source_file": batch.get("document_id", ""),
+                    "page_number": None,
+                    "heading_index": src_seg.get("heading_index"),
+                    "source_start_line": src_seg.get("source_start_line"),
+                    "source_end_line": src_seg.get("source_end_line"),
+                }
+    spec_records = m7_run(config, classifications, translations, provenance_map)
 
     # ---- M8: XLSX Report Generator ----
     from .modules.module8_report import run as m8_run

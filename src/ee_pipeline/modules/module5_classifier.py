@@ -6,6 +6,14 @@ Classifies each requirement candidate on two axes:
 
 Uses the ChatT API (ChatT-VIBE model) for classification.
 Supports parallel processing with bounded concurrency and metadata filtering.
+
+Input format (from M4):
+  Each item is a batch dict with:
+    - merged_text: the text to classify
+    - source_segments: list of original segment info
+    - batch_id: batch identifier
+    - skip_candidate: True if all source segments are metadata
+    - processing_order: {first_heading_index, first_source_line}
 """
 
 from __future__ import annotations
@@ -177,7 +185,7 @@ async def _classify_single_async(
     url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
 
     headers = {
-        "Authorization": f"******",
+        "Authorization": f"Bearer {CHATT_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -225,103 +233,97 @@ async def _classify_with_retry(
 
 
 async def classify_batch_parallel(
-    segments: list[dict],
+    batches: list[dict],
     max_concurrency: int = 4,
-    batch_size: int = 10,
 ) -> list[ClassificationResult]:
-    """Classify segments in parallel with bounded concurrency.
+    """Classify merged batches in parallel with bounded concurrency.
+
+    Each batch from M4 contains:
+      - merged_text: text to classify
+      - source_segments: list of original segment info
+      - batch_id: batch identifier
+      - skip_candidate: True if all source segments are metadata
 
     Args:
-        segments: List of segment dicts with 'content' and optional 'heading'.
+        batches: List of batch dicts from M4.
         max_concurrency: Maximum number of parallel API calls (default: 4).
-        batch_size: Number of segments to process before writing to file.
+                         Increase to 8 after confirming stability.
 
     Returns:
-        List of ClassificationResult objects.
+        List of ClassificationResult objects (one per batch).
     """
     semaphore = asyncio.Semaphore(max_concurrency)
     results: list[ClassificationResult] = []
     skipped_count = 0
 
-    # Filter out metadata segments first
+    # Filter out skip_candidate batches first
     to_classify = []
-    for i, seg in enumerate(segments):
-        is_metadata, skip_reason = _is_metadata_segment(seg)
-        if is_metadata:
+    for i, batch in enumerate(batches):
+        if batch.get("skip_candidate", False):
             skipped_count += 1
-            print(f"[M5] Skipping metadata segment {i+1}: {skip_reason}")
+            print(f"[M5] Skipping skip_candidate batch {i+1}: {batch.get('skip_reason', '')}")
             continue
-        to_classify.append(seg)
+        to_classify.append(batch)
 
-    print(f"[M5] {len(segments)} total segments, {skipped_count} metadata skipped, {len(to_classify)} to classify")
+    print(f"[M5] {len(batches)} total batches, {skipped_count} skip_candidate skipped, {len(to_classify)} to classify")
 
-    # Process in batches with bounded concurrency
-    for batch_start in range(0, len(to_classify), batch_size):
-        batch_end = min(batch_start + batch_size, len(to_classify))
-        batch = to_classify[batch_start:batch_end]
-        batch_id = f"batch_{batch_start // batch_size + 1:03d}"
+    # All tasks share the semaphore — bounded concurrency handles everything
+    async def classify_one(batch_item: dict, idx: int):
+        async with semaphore:
+            return await _classify_with_retry(
+                batch_item.get("merged_text", ""),
+                None,
+                batch_item.get("batch_id", f"batch_{idx+1:03d}"),
+                batch_item.get("batch_id", ""),
+            )
 
-        print(f"[M5] Processing batch {batch_id} ({len(batch)} segments)...")
+    tasks = [classify_one(b, i) for i, b in enumerate(to_classify)]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Create tasks with semaphore for bounded concurrency
-        async def classify_one(seg: dict, idx: int):
-            async with semaphore:
-                return await _classify_with_retry(
-                    seg.get("content", ""),
-                    seg.get("heading"),
-                    seg.get("segment_id", f"seg_{idx+1:03d}"),
-                    batch_id,
-                )
+    # Process results
+    for i, (result, success) in enumerate(batch_results):
+        batch_item = to_classify[i]
 
-        # Run all tasks in the batch concurrently (bounded by semaphore)
-        tasks = [classify_one(seg, batch_start + i) for i, seg in enumerate(batch)]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        if isinstance(result, Exception) or not success:
+            error_msg = str(result) if isinstance(result, Exception) else result.get("error", "Unknown error")
+            print(f"       [M5] FAILED batch {batch_item.get('batch_id', '?')}: {error_msg}")
+            results.append(ClassificationResult(
+                block_id=batch_item.get("batch_id", f"batch_{i+1:03d}"),
+                doc_id=batch_item.get("document_id", "unknown"),
+                is_requirement=False,
+                is_ee_related=False,
+                reasoning=f"API error: {error_msg}",
+                original_content=batch_item.get("merged_text", ""),
+            ))
+        else:
+            if "error" in result:
+                print(f"       [M5] ERROR: {result['error']}")
+                continue
 
-        # Process results
-        for i, (result, success) in enumerate(batch_results):
-            idx = batch_start + i
-            seg = to_classify[i]
+            # Parse ee_category
+            ee_cat_str = result.get("ee_category", "Other")
+            try:
+                ee_category = EECategory(ee_cat_str)
+            except ValueError:
+                ee_category = EECategory.OTHER
 
-            if isinstance(result, Exception) or not success:
-                error_msg = str(result) if isinstance(result, Exception) else result.get("error", "Unknown error")
-                print(f"       [M5] FAILED segment {idx+1}: {error_msg}")
-                results.append(ClassificationResult(
-                    block_id=seg.get("segment_id", f"seg_{idx+1:03d}"),
-                    doc_id=seg.get("doc_id", "unknown"),
-                    is_requirement=False,
-                    is_ee_related=False,
-                    reasoning=f"API error: {error_msg}",
-                    original_content=seg.get("content", ""),
-                ))
-            else:
-                if "error" in result:
-                    print(f"       [M5] ERROR: {result['error']}")
-                    continue
+            classification_result = ClassificationResult(
+                block_id=batch_item.get("batch_id", f"batch_{i+1:03d}"),
+                doc_id=batch_item.get("document_id", "unknown"),
+                is_requirement=result.get("is_requirement", False),
+                is_ee_related=result.get("is_ee_related", False),
+                ee_category=ee_category,
+                reasoning=result.get("reasoning", ""),
+                original_content=batch_item.get("merged_text", ""),
+            )
+            results.append(classification_result)
 
-                # Parse ee_category
-                ee_cat_str = result.get("ee_category", "Other")
-                try:
-                    ee_category = EECategory(ee_cat_str)
-                except ValueError:
-                    ee_category = EECategory.OTHER
+            # Summary
+            req_str = "REQ" if classification_result.is_requirement else "non-REQ"
+            ee_str = "EE" if classification_result.is_ee_related else "non-EE"
+            print(f"       → {req_str} / {ee_str} | {ee_category.value}")
 
-                classification_result = ClassificationResult(
-                    block_id=seg.get("segment_id", f"seg_{idx+1:03d}"),
-                    doc_id=seg.get("doc_id", "unknown"),
-                    is_requirement=result.get("is_requirement", False),
-                    is_ee_related=result.get("is_ee_related", False),
-                    ee_category=ee_category,
-                    reasoning=result.get("reasoning", ""),
-                    original_content=seg.get("content", ""),
-                )
-                results.append(classification_result)
-
-                # Summary
-                req_str = "REQ" if classification_result.is_requirement else "non-REQ"
-                ee_str = "EE" if classification_result.is_ee_related else "non-EE"
-                print(f"       → {req_str} / {ee_str} | {ee_category.value}")
-
-    # Sort results by segment_id to maintain original order
+    # Sort results by batch_id to maintain original order
     results.sort(key=lambda x: x.block_id)
 
     return results
@@ -396,7 +398,7 @@ def _classify_single(text: str, heading: str | None = None) -> dict[str, Any]:
     url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
 
     headers = {
-        "Authorization": f"******",
+        "Authorization": f"Bearer {CHATT_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -415,13 +417,19 @@ def _classify_single(text: str, heading: str | None = None) -> dict[str, Any]:
     return _parse_llm_response(content)
 
 
-def run(config: PipelineConfig, segments: list[dict]) -> list[ClassificationResult]:
-    """Execute M5: classify all segments via ChatT API.
+def run(config: PipelineConfig, batches: list[dict]) -> list[ClassificationResult]:
+    """Execute M5: classify all merged batches via ChatT API.
 
     Uses parallel processing with bounded concurrency and metadata filtering.
     Writes classifications.jsonl to output.
+
+    Args:
+        batches: List of batch dicts from M4 (each with merged_text, source_segments, etc.)
     """
-    results = classify_batch_parallel(segments, max_concurrency=4, batch_size=10)
+    import time as _time
+    t0 = _time.time()
+    results = classify_batch_parallel(batches, max_concurrency=4)
+    m5_elapsed = _time.time() - t0
 
     classifications_path = config.run_dir / "classifications.jsonl"
     with open(classifications_path, "w", encoding="utf-8") as f:
@@ -434,4 +442,5 @@ def run(config: PipelineConfig, segments: list[dict]) -> list[ClassificationResu
     both_count = sum(1 for r in results if r.is_requirement and r.is_ee_related)
 
     print(f"[M5] {len(results)} classified | REQ: {req_count} | EE: {ee_count} | EE-REQ: {both_count}")
+    print(f"[M5] Elapsed: {m5_elapsed:.2f}s ({m5_elapsed/len(results)*1000:.0f}ms/batch)")
     return results

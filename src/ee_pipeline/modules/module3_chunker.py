@@ -56,7 +56,7 @@ def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> lis
         max_chunk_size: Maximum characters per chunk.
 
     Returns:
-        List of ChunkedBlock objects.
+        List of ChunkedBlock objects with provenance tracking.
     """
     groups = _group_by_heading(blocks)
     chunks: list[ChunkedBlock] = []
@@ -71,6 +71,9 @@ def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> lis
             sub_blocks: list[DocumentBlock] = []
             sub_content: list[str] = []
             sub_hierarchy = hierarchy
+            sub_block_ids: list[str] = []
+            sub_heading_indices: list[int] = []
+            sub_line_ranges: list[dict] = []
 
             for block in group:
                 block_text = block.content
@@ -82,13 +85,24 @@ def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> lis
                         blocks=sub_blocks,
                         combined_content="\n".join(sub_content),
                         heading_hierarchy=sub_hierarchy,
+                        source_block_ids=sub_block_ids,
+                        source_heading_indices=sub_heading_indices,
+                        source_line_ranges=sub_line_ranges,
                     ))
                     sub_blocks = [block]
                     sub_content = [block_text]
+                    sub_block_ids = [block.block_id]
+                    sub_heading_indices = [block.heading_index] if block.heading_index is not None else []
+                    sub_line_ranges = [{"start_line": block.source_start_line, "end_line": block.source_end_line}] if block.source_start_line is not None else []
                     sub_hierarchy = _build_heading_hierarchy([block])
                 else:
                     sub_blocks.append(block)
                     sub_content.append(block_text)
+                    sub_block_ids.append(block.block_id)
+                    if block.heading_index is not None:
+                        sub_heading_indices.append(block.heading_index)
+                    if block.source_start_line is not None:
+                        sub_line_ranges.append({"start_line": block.source_start_line, "end_line": block.source_end_line})
 
             if sub_blocks:
                 chunk_id_counter += 1
@@ -97,6 +111,9 @@ def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> lis
                     blocks=sub_blocks,
                     combined_content="\n".join(sub_content),
                     heading_hierarchy=sub_hierarchy,
+                    source_block_ids=sub_block_ids,
+                    source_heading_indices=sub_heading_indices,
+                    source_line_ranges=sub_line_ranges,
                 ))
         else:
             chunk_id_counter += 1
@@ -105,6 +122,9 @@ def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> lis
                 blocks=group,
                 combined_content=combined,
                 heading_hierarchy=hierarchy,
+                source_block_ids=[b.block_id for b in group],
+                source_heading_indices=[b.heading_index for b in group if b.heading_index is not None],
+                source_line_ranges=[{"start_line": b.source_start_line, "end_line": b.source_end_line} for b in group if b.source_start_line is not None],
             ))
 
     return chunks

@@ -22,6 +22,7 @@ def _parse_pdf(path: str, doc_id: str) -> list[DocumentBlock]:
     """Extract heading-structured blocks from a PDF."""
     blocks: list[DocumentBlock] = []
     doc = fitz.open(path)
+    heading_index = 0
 
     for page_num, page in enumerate(doc, start=1):
         text = page.get_text()
@@ -30,9 +31,10 @@ def _parse_pdf(path: str, doc_id: str) -> list[DocumentBlock]:
         current_heading: str | None = None
         current_level: int = 0
         current_content: list[str] = []
+        current_start_line: int = 0
 
         def _flush():
-            nonlocal current_heading, current_level, current_content
+            nonlocal current_heading, current_level, current_content, current_start_line, heading_index
             if current_content:
                 blocks.append(DocumentBlock(
                     doc_id=doc_id,
@@ -42,12 +44,16 @@ def _parse_pdf(path: str, doc_id: str) -> list[DocumentBlock]:
                     content="\n".join(current_content).strip(),
                     page_number=page_num,
                     source_file=Path(path).name,
+                    heading_index=heading_index if current_heading else None,
+                    source_start_line=current_start_line,
+                    source_end_line=current_start_line + len(current_content) - 1,
                 ))
             current_heading = None
             current_level = 0
             current_content = []
+            current_start_line = 0
 
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -58,8 +64,12 @@ def _parse_pdf(path: str, doc_id: str) -> list[DocumentBlock]:
                 _flush()
                 current_heading = stripped
                 current_level = heading_match["level"]
+                current_start_line = page_num * 1000 + line_idx  # Approximate line number
+                heading_index += 1
                 current_content = []
             else:
+                if not current_content:
+                    current_start_line = page_num * 1000 + line_idx
                 current_content.append(stripped)
 
         _flush()
@@ -96,12 +106,14 @@ def _parse_docx(path: str, doc_id: str) -> list[DocumentBlock]:
     doc = DocxDocument(path)
 
     block_id_counter = 0
+    heading_index = 0
     current_heading: str | None = None
     current_level: int = 0
     current_content: list[str] = []
+    current_start_line: int = 0
 
     def _flush():
-        nonlocal current_heading, current_level, current_content, block_id_counter
+        nonlocal current_heading, current_level, current_content, current_start_line, block_id_counter, heading_index
         if current_content:
             block_id_counter += 1
             blocks.append(DocumentBlock(
@@ -111,12 +123,16 @@ def _parse_docx(path: str, doc_id: str) -> list[DocumentBlock]:
                 heading_level=current_level,
                 content="\n".join(current_content).strip(),
                 source_file=Path(path).name,
+                heading_index=heading_index if current_heading else None,
+                source_start_line=current_start_line,
+                source_end_line=current_start_line + len(current_content) - 1,
             ))
         current_heading = None
         current_level = 0
         current_content = []
+        current_start_line = 0
 
-    for para in doc.paragraphs:
+    for para_idx, para in enumerate(doc.paragraphs):
         style_name = para.style.name.lower() if para.style else ""
         text = para.text.strip()
 
@@ -129,8 +145,12 @@ def _parse_docx(path: str, doc_id: str) -> list[DocumentBlock]:
             _flush()
             current_heading = text
             current_level = heading_level
+            current_start_line = para_idx
+            heading_index += 1
             current_content = []
         else:
+            if not current_content:
+                current_start_line = para_idx
             current_content.append(text)
 
     _flush()
@@ -158,34 +178,38 @@ def _parse_pptx(path: str, doc_id: str) -> list[DocumentBlock]:
     """Extract heading-structured blocks from a PPTX."""
     blocks: list[DocumentBlock] = []
     prs = Presentation(path)
+    heading_index = 0
 
-    block_id_counter = 0
     for slide_num, slide in enumerate(prs.slides, start=1):
         current_heading: str | None = None
         current_level: int = 0
         current_content: list[str] = []
+        current_start_line: int = 0
 
         def _flush_slide():
-            nonlocal current_heading, current_level, current_content, block_id_counter
+            nonlocal current_heading, current_level, current_content, current_start_line, heading_index
             if current_content:
-                block_id_counter += 1
                 blocks.append(DocumentBlock(
                     doc_id=doc_id,
-                    block_id=f"{doc_id}_s{slide_num}_b{block_id_counter}",
+                    block_id=f"{doc_id}_s{slide_num}_b{len(blocks)+1}",
                     heading=current_heading,
                     heading_level=current_level,
                     content="\n".join(current_content).strip(),
                     page_number=slide_num,
                     source_file=Path(path).name,
+                    heading_index=heading_index if current_heading else None,
+                    source_start_line=current_start_line,
+                    source_end_line=current_start_line + len(current_content) - 1,
                 ))
             current_heading = None
             current_level = 0
             current_content = []
+            current_start_line = 0
 
-        for shape in slide.shapes:
+        for shape_idx, shape in enumerate(slide.shapes):
             if not shape.has_text_frame:
                 continue
-            for para in shape.text_frame.paragraphs:
+            for para_idx, para in enumerate(shape.text_frame.paragraphs):
                 text = para.text.strip()
                 if not text:
                     continue
@@ -195,8 +219,12 @@ def _parse_pptx(path: str, doc_id: str) -> list[DocumentBlock]:
                     _flush_slide()
                     current_heading = text
                     current_level = 1
+                    current_start_line = slide_num * 1000 + shape_idx * 100 + para_idx
+                    heading_index += 1
                     current_content = []
                 else:
+                    if not current_content:
+                        current_start_line = slide_num * 1000 + shape_idx * 100 + para_idx
                     current_content.append(text)
 
         _flush_slide()

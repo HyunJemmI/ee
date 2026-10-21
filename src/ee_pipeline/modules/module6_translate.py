@@ -45,7 +45,7 @@ async def _translate_single_async(text: str) -> str:
     url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
 
     headers = {
-        "Authorization": f"******",
+        "Authorization": f"Bearer {CHATT_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -86,7 +86,6 @@ async def _translate_with_retry(text: str, max_retries: int = 3) -> tuple[str, b
 async def translate_batch_parallel(
     classifications: list[ClassificationResult],
     max_concurrency: int = 4,
-    batch_size: int = 10,
 ) -> list[TranslationResult]:
     """Translate EE-related requirement statements in parallel.
 
@@ -95,7 +94,7 @@ async def translate_batch_parallel(
     Args:
         classifications: List of ClassificationResult from M5.
         max_concurrency: Maximum number of parallel API calls (default: 4).
-        batch_size: Number of segments to process before writing to file.
+                         Increase to 8 after confirming stability.
 
     Returns:
         List of TranslationResult objects.
@@ -106,49 +105,41 @@ async def translate_batch_parallel(
 
     print(f"[M6] Translating {len(to_translate)} EE requirements...")
 
-    # Process in batches with bounded concurrency
-    for batch_start in range(0, len(to_translate), batch_size):
-        batch_end = min(batch_start + batch_size, len(to_translate))
-        batch = to_translate[batch_start:batch_end]
-        batch_id = f"batch_{batch_start // batch_size + 1:03d}"
+    # All tasks share the semaphore — bounded concurrency handles everything
+    async def translate_one(cls: ClassificationResult):
+        async with semaphore:
+            return await _translate_with_retry(cls.original_content)
 
-        print(f"[M6] Processing batch {batch_id} ({len(batch)} translations)...")
+    tasks = [translate_one(cls) for cls in to_translate]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        async def translate_one(cls: ClassificationResult, idx: int):
-            async with semaphore:
-                return await _translate_with_retry(cls.original_content)
+    for i, (result, success) in enumerate(batch_results):
+        cls = to_translate[i]
 
-        tasks = [translate_one(cls, batch_start + i) for i, cls in enumerate(batch)]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        if isinstance(result, Exception) or not success:
+            error_msg = str(result) if isinstance(result, Exception) else "Unknown error"
+            print(f"       [M6] FAILED [{cls.block_id}]: {error_msg}")
+            results.append(TranslationResult(
+                block_id=cls.block_id,
+                doc_id=cls.doc_id,
+                original_text=cls.original_content,
+                translated_text="",
+                status="REVIEW_NEEDED",
+            ))
+        else:
+            status = "OK" if result and len(result) > 5 else "REVIEW_NEEDED"
 
-        for i, (result, success) in enumerate(batch_results):
-            idx = batch_start + i
-            cls = to_translate[i]
+            translation_result = TranslationResult(
+                block_id=cls.block_id,
+                doc_id=cls.doc_id,
+                original_text=cls.original_content,
+                translated_text=result,
+                status=status,
+            )
+            results.append(translation_result)
 
-            if isinstance(result, Exception) or not success:
-                error_msg = str(result) if isinstance(result, Exception) else "Unknown error"
-                print(f"       [M6] FAILED [{cls.block_id}]: {error_msg}")
-                results.append(TranslationResult(
-                    block_id=cls.block_id,
-                    doc_id=cls.doc_id,
-                    original_text=cls.original_content,
-                    translated_text="",
-                    status="REVIEW_NEEDED",
-                ))
-            else:
-                status = "OK" if result and len(result) > 5 else "REVIEW_NEEDED"
-
-                translation_result = TranslationResult(
-                    block_id=cls.block_id,
-                    doc_id=cls.doc_id,
-                    original_text=cls.original_content,
-                    translated_text=result,
-                    status=status,
-                )
-                results.append(translation_result)
-
-                if status == "REVIEW_NEEDED":
-                    print(f"       WARNING: Translation may need review")
+            if status == "REVIEW_NEEDED":
+                print(f"       WARNING: Translation may need review")
 
     # Sort results by block_id to maintain original order
     results.sort(key=lambda x: x.block_id)
@@ -213,7 +204,7 @@ def _translate_single(text: str) -> str:
     url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
 
     headers = {
-        "Authorization": f"******",
+        "Authorization": f"Bearer {CHATT_API_KEY}",
         "Content-Type": "application/json",
     }
 
@@ -239,7 +230,10 @@ def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> 
     Returns list of TranslationResult objects.
     Writes translated.jsonl to output.
     """
-    results = translate_batch_parallel(classifications, max_concurrency=4, batch_size=10)
+    import time as _time
+    t0 = _time.time()
+    results = translate_batch_parallel(classifications, max_concurrency=4)
+    m6_elapsed = _time.time() - t0
 
     translated_path = config.run_dir / "translated.jsonl"
     with open(translated_path, "w", encoding="utf-8") as f:
@@ -250,4 +244,5 @@ def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> 
     review_count = sum(1 for r in results if r.status == "REVIEW_NEEDED")
 
     print(f"[M6] {len(results)} translated | OK: {ok_count} | Review needed: {review_count}")
+    print(f"[M6] Elapsed: {m6_elapsed:.2f}s ({m6_elapsed/max(len(results),1)*1000:.0f}ms/batch)")
     return results

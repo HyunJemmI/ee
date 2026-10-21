@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,9 +16,9 @@ load_dotenv()
 # ChatT API configuration
 # ---------------------------------------------------------------------------
 
-CHATT_API_KEY: str = "sk-a687796e271e423299c4ee817727b701"
-CHATT_BASE_URL: str = "https://chat.hyundai-transys.com/"
-CHATT_MODEL: str = "ChatT-VIBE"
+CHATT_API_KEY: str = os.getenv("CHATT_API_KEY", "")
+CHATT_BASE_URL: str = os.getenv("CHATT_BASE_URL", "https://chat.hyundai-transys.com/")
+CHATT_MODEL: str = os.getenv("CHATT_MODEL", "ChatT-VIBE")
 
 
 # ---------------------------------------------------------------------------

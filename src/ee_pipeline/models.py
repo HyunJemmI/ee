@@ -29,6 +29,10 @@ class DocumentBlock(BaseModel):
     content: str
     page_number: Optional[int] = None
     source_file: str
+    # Provenance tracking
+    heading_index: Optional[int] = None
+    source_start_line: Optional[int] = None
+    source_end_line: Optional[int] = None
 
 
 class ChunkedBlock(BaseModel):
@@ -37,6 +41,10 @@ class ChunkedBlock(BaseModel):
     blocks: list[DocumentBlock] = Field(default_factory=list)
     combined_content: str
     heading_hierarchy: str = ""
+    # Provenance tracking
+    source_block_ids: list[str] = Field(default_factory=list)
+    source_heading_indices: list[int] = Field(default_factory=list)
+    source_line_ranges: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +119,10 @@ class SpecRecord(BaseModel):
     matched_keywords: list[str] = Field(default_factory=list)
     source_file: str
     page_number: Optional[int] = None
+    # Provenance tracking
+    heading_index: Optional[int] = None
+    source_start_line: Optional[int] = None
+    source_end_line: Optional[int] = None
 
 
 class ClassificationSummary(BaseModel):
