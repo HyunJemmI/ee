@@ -1,111 +1,113 @@
-"""M2.5: Keyword-based file pre-screening.
-
-Filters out files that have no EE-related keywords, reducing LLM costs.
-Uses the keyword lists from the attached HTML reference document.
-"""
+"""M2.5: deterministic keyword screening before LLM processing."""
 
 from __future__ import annotations
 
-import json
 import re
+from collections import defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 
 from ..config import PipelineConfig
+from ..io_utils import read_jsonl_models, write_jsonl
 from ..models import DocumentBlock, FileScreenResult, KeywordMatch
 
 
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    """Compile a case-insensitive whole-term pattern.
+
+    Boundaries prevent a keyword such as ``CAN`` from matching ``candy`` while
+    still supporting phrases and punctuation used in technical documents.
+    """
+    escaped = re.escape(keyword.strip())
+    return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+
+
 def _extract_keywords(text: str, keywords: dict) -> list[KeywordMatch]:
-    """Find keyword matches in text using primary + secondary keyword lists."""
+    """Find each configured keyword once with its total occurrence count."""
     matches: list[KeywordMatch] = []
-    text_lower = text.lower()
-
-    # Primary keywords (Section 3 of reference doc)
-    for category, kw_list in keywords.get("primary", {}).items():
-        for keyword in kw_list:
-            count = len(re.findall(re.escape(keyword.lower()), text_lower))
-            if count > 0:
-                matches.append(KeywordMatch(
-                    keyword=keyword,
-                    category=category,
-                    count=count,
-                ))
-
-    # Secondary keywords (Section 4 of reference doc)
-    for category, kw_list in keywords.get("secondary", {}).items():
-        for keyword in kw_list:
-            count = len(re.findall(re.escape(keyword.lower()), text_lower))
-            if count > 0:
-                # Avoid duplicate if already matched in primary
-                existing = next((m for m in matches if m.keyword == keyword), None)
-                if existing is None:
-                    matches.append(KeywordMatch(
-                        keyword=keyword,
-                        category=category,
-                        count=count,
-                    ))
-
+    seen: set[str] = set()
+    for group_name in ("primary", "secondary"):
+        for category, keyword_list in keywords.get(group_name, {}).items():
+            for raw_keyword in keyword_list:
+                keyword = str(raw_keyword).strip()
+                normalized = keyword.casefold()
+                if not keyword or normalized in seen:
+                    continue
+                count = len(_keyword_pattern(keyword).findall(text))
+                if count:
+                    matches.append(KeywordMatch(keyword=keyword, category=category, count=count))
+                    seen.add(normalized)
     return matches
 
 
-def screen_file(file_blocks: list[DocumentBlock], config: PipelineConfig) -> FileScreenResult:
-    """Screen a single file's blocks for EE keywords.
-
-    Decision logic:
-    - If total keyword matches >= min_primary_keywords → PASS
-    - Otherwise → SKIP
-    """
-    combined_text = "\n".join(b.content for b in file_blocks)
+def screen_file(
+    file_blocks: list[DocumentBlock],
+    config: PipelineConfig,
+    *,
+    doc_id: str | None = None,
+    source_file: str | None = None,
+) -> FileScreenResult:
+    """Screen one file and return its decision plus keyword evidence."""
+    combined_text = "\n".join(block.content for block in file_blocks)
     matches = _extract_keywords(combined_text, config.keywords)
-    total = sum(m.count for m in matches)
-
-    decision = "PASS" if total >= config.min_primary_keywords else "SKIP"
-
+    total_matches = sum(match.count for match in matches)
+    resolved_doc_id = doc_id or (file_blocks[0].doc_id if file_blocks else "")
+    resolved_source = source_file or (file_blocks[0].source_file if file_blocks else "")
+    decision = "PASS" if total_matches >= config.min_primary_keywords else "SKIP"
     return FileScreenResult(
-        doc_id=file_blocks[0].doc_id if file_blocks else "",
-        source_file=file_blocks[0].source_file if file_blocks else "",
+        doc_id=resolved_doc_id,
+        source_file=resolved_source,
         matched_keywords=matches,
-        total_matches=total,
+        total_matches=total_matches,
         decision=decision,
     )
 
 
-def run(config: PipelineConfig, blocks: list[DocumentBlock]) -> tuple[list[DocumentBlock], list[DocumentBlock]]:
-    """Execute M2.5: screen files by keywords.
+def load_results(run_dir: Path) -> list[FileScreenResult]:
+    """Load persisted screening results for M8 or standalone workflows."""
+    return read_jsonl_models(run_dir / "prescreen_results.jsonl", FileScreenResult)
 
-    Returns:
-        (pass_blocks, skip_blocks) — files that pass and files that are skipped.
+
+def run(
+    config: PipelineConfig,
+    blocks: list[DocumentBlock],
+    manifest: Iterable[dict] | None = None,
+) -> tuple[list[DocumentBlock], list[DocumentBlock]]:
+    """Screen documents, persist evidence, and return pass/skip blocks.
+
+    ``manifest`` is optional for backwards compatibility. When supplied, empty
+    or unparseable files are still represented in the screening report.
     """
-    # Group blocks by doc_id
-    doc_blocks: dict[str, list[DocumentBlock]] = {}
+    config.prepare_run_dir()
+    grouped: defaultdict[str, list[DocumentBlock]] = defaultdict(list)
     for block in blocks:
-        doc_blocks.setdefault(block.doc_id, []).append(block)
+        grouped[block.doc_id].append(block)
+
+    manifest_entries = list(manifest or [])
+    document_ids = [entry["doc_id"] for entry in manifest_entries] if manifest_entries else sorted(grouped)
 
     pass_blocks: list[DocumentBlock] = []
     skip_blocks: list[DocumentBlock] = []
-    prescreen_results: list[FileScreenResult] = []
+    results: list[FileScreenResult] = []
 
-    for doc_id, file_blocks in doc_blocks.items():
-        result = screen_file(file_blocks, config)
-        prescreen_results.append(result)
-
+    for doc_id in document_ids:
+        file_blocks = grouped.get(doc_id, [])
+        entry = next((item for item in manifest_entries if item["doc_id"] == doc_id), None)
+        result = screen_file(
+            file_blocks,
+            config,
+            doc_id=doc_id,
+            source_file=(Path(entry["path"]).name if entry else None),
+        )
+        results.append(result)
         if result.decision == "PASS":
             pass_blocks.extend(file_blocks)
             print(f"[M2.5] PASS  {doc_id} ({result.total_matches} keyword matches)")
         else:
             skip_blocks.extend(file_blocks)
-            print(f"[M2.5] SKIP  {doc_id} (no EE keywords found)")
+            print(f"[M2.5] SKIP  {doc_id} ({result.total_matches} keyword matches)")
 
-    # Write prescreen results
-    results_path = config.run_dir / "prescreen_results.jsonl"
-    with open(results_path, "w", encoding="utf-8") as f:
-        for r in prescreen_results:
-            f.write(r.model_dump_json() + "\n")
-
-    # Write pass blocks
-    pass_path = config.run_dir / "prescreen_pass_blocks.jsonl"
-    with open(pass_path, "w", encoding="utf-8") as f:
-        for b in pass_blocks:
-            f.write(b.model_dump_json() + "\n")
-
+    write_jsonl(config.run_dir / "prescreen_results.jsonl", results)
+    write_jsonl(config.run_dir / "prescreen_pass_blocks.jsonl", pass_blocks)
     print(f"[M2.5] {len(pass_blocks)} blocks passed, {len(skip_blocks)} blocks skipped")
     return pass_blocks, skip_blocks

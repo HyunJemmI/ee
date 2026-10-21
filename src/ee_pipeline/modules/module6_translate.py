@@ -1,248 +1,219 @@
-﻿"""M6: Translate & Validate — translates EE requirements to Korean via ChatT API.
-
-Translates only the EE-related requirement statements (intersection of M5 axes).
-Supports parallel processing with bounded concurrency.
-"""
+"""M6: translate classified E/E requirements with the ChatT API."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import random
-from pathlib import Path
+import re
+import time
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from ..config import CHATT_API_KEY, CHATT_BASE_URL, CHATT_MODEL, PipelineConfig
+from ..chatt_client import request_chat_completion, request_chat_completion_sync, validate_chatt_config
+from ..config import CHATT_MODEL, TRANSLATION_PROMPT, TRANSLATION_SYSTEM_PROMPT, PipelineConfig
+from ..io_utils import AsyncRequestPacer, write_jsonl
 from ..models import ClassificationResult, TranslationResult
 
 
-def _build_translation_payload(text: str) -> dict:
-    """Build the API request payload for translation."""
-    prompt = f"""Translate the following automotive E/E requirement statement from English to Korean.
-Maintain technical accuracy and use standard automotive industry terminology.
-
-Original: {text}
-
-Provide only the Korean translation, nothing else. Do not add explanations or notes."""
-
+def _build_translation_payload(
+    text: str,
+    *,
+    model: str = CHATT_MODEL,
+    system_prompt: str = TRANSLATION_SYSTEM_PROMPT,
+    prompt_template: str = TRANSLATION_PROMPT,
+) -> dict:
+    """Build an OpenAI-compatible ChatT chat-completions request."""
     return {
-        "model": CHATT_MODEL,
+        "model": model,
         "messages": [
-            {"role": "system", "content": "You are a professional automotive technical translator. Translate English to Korean with precise technical terminology."},
-            {"role": "user", "content": prompt},
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": prompt_template.format(text=text),
+            },
         ],
-        "temperature": 0.1,
+        "temperature": 0.0,
         "max_tokens": 1000,
     }
 
 
-async def _translate_single_async(text: str) -> str:
-    """Call ChatT API for a single translation (async version)."""
-    payload = _build_translation_payload(text)
-
-    url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
-
-    headers = {
-        "Authorization": f"Bearer {CHATT_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError("No choices in LLM response")
-
-    content = choices[0].get("message", {}).get("content")
-    if content is None:
-        raise ValueError("LLM returned None content")
-    return content.strip()
+def _is_usable_translation(text: str) -> bool:
+    return bool(text and len(text.strip()) > 5)
 
 
-async def _translate_with_retry(text: str, max_retries: int = 3) -> tuple[str, bool]:
-    """Call ChatT API with retry logic.
+def _retry_after_seconds(error: Exception) -> float | None:
+    """Read Retry-After or the delay suggested in a rate-limit error."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    match = re.search(r"try again in\s+([\d.]+)s", str(error), flags=re.IGNORECASE)
+    return float(match.group(1)) if match else None
 
-    Returns:
-        (translated_text, success)
-    """
-    for attempt in range(max_retries):
+
+async def _translate_single_async(
+    text: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    config: PipelineConfig | None = None,
+    pacer: AsyncRequestPacer | None = None,
+) -> str:
+    """Translate once through ChatT."""
+    settings = config or PipelineConfig()
+    validate_chatt_config(settings)
+    payload = _build_translation_payload(
+        text,
+        model=settings.chatt_model,
+        system_prompt=settings.translation_system_prompt,
+        prompt_template=settings.translation_prompt,
+    )
+    if pacer is not None:
+        await pacer.wait()
+
+    if client is not None:
+        return await request_chat_completion(client, settings, payload)
+    async with httpx.AsyncClient(timeout=settings.request_timeout, follow_redirects=True) as owned_client:
+        return await request_chat_completion(owned_client, settings, payload)
+
+
+async def _translate_with_retry(
+    text: str,
+    max_retries: int = 3,
+    *,
+    client: httpx.AsyncClient | None = None,
+    config: PipelineConfig | None = None,
+    label: str = "",
+    pacer: AsyncRequestPacer | None = None,
+) -> tuple[str, bool]:
+    """Retry one translation and return text plus success state."""
+    attempts = max(1, max_retries)
+    last_error = "unknown error"
+    for attempt in range(attempts):
         try:
-            translated = await _translate_single_async(text)
+            translated = await _translate_single_async(text, client=client, config=config, pacer=pacer)
             return translated, True
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                print(f"       [M6] Retry {attempt+1}/{max_retries} after {wait_time:.1f}s...")
+        except Exception as error:
+            last_error = str(error)
+            if attempt + 1 < attempts:
+                wait_time = _retry_after_seconds(error)
+                if wait_time is None:
+                    wait_time = (2**attempt) + random.uniform(0, 1)
+                else:
+                    wait_time += random.uniform(0.25, 0.75)
+                print(f"       [M6] Retry {attempt + 1}/{max_retries} for {label} after {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
-            else:
-                return "", False
+    print(f"       [M6] FAILED [{label}]: {last_error}")
+    return "", False
+
+
+def _translation_result(classification: ClassificationResult, text: str, success: bool) -> TranslationResult:
+    usable = success and _is_usable_translation(text)
+    return TranslationResult(
+        block_id=classification.block_id,
+        doc_id=classification.doc_id,
+        cur_id=classification.cur_id,
+        original_text=classification.original_content,
+        translated_text=text if success else "",
+        status="OK" if usable else "REVIEW_NEEDED",
+    )
 
 
 async def translate_batch_parallel(
     classifications: list[ClassificationResult],
-    max_concurrency: int = 8,
+    max_concurrency: int = 4,
+    *,
+    config: PipelineConfig | None = None,
 ) -> list[TranslationResult]:
-    """Translate EE-related requirement statements in parallel.
+    """Translate only requirement + E/E classification intersections."""
+    settings = config or PipelineConfig()
+    selected = [item for item in classifications if item.is_requirement and item.is_ee_related]
+    print(f"[M6] Translating {len(selected)} EE requirements...")
+    if not selected:
+        return []
+    validate_chatt_config(settings)
+    pacer = AsyncRequestPacer(settings.chatt_requests_per_minute)
 
-    Only translates blocks where is_requirement=True AND is_ee_related=True.
+    semaphore = asyncio.Semaphore(max(1, max_concurrency))
+    async with httpx.AsyncClient(timeout=settings.request_timeout, follow_redirects=True) as client:
+        async def translate_one(item: ClassificationResult) -> tuple[str, bool]:
+            async with semaphore:
+                return await _translate_with_retry(
+                    item.original_content,
+                    settings.max_retries,
+                    client=client,
+                    config=settings,
+                    label=item.block_id,
+                    pacer=pacer,
+                )
 
-    Args:
-        classifications: List of ClassificationResult from M5.
-        max_concurrency: Maximum number of parallel API calls (default: 4).
-                         Increase to 8 after confirming stability.
+        raw_results = await asyncio.gather(
+            *(translate_one(item) for item in selected),
+            return_exceptions=True,
+        )
 
-    Returns:
-        List of TranslationResult objects.
-    """
-    semaphore = asyncio.Semaphore(max_concurrency)
     results: list[TranslationResult] = []
-    to_translate = [c for c in classifications if c.is_requirement and c.is_ee_related]
-
-    print(f"[M6] Translating {len(to_translate)} EE requirements...")
-
-    # All tasks share the semaphore — bounded concurrency handles everything
-    async def translate_one(cls: ClassificationResult):
-        async with semaphore:
-            return await _translate_with_retry(cls.original_content)
-
-    tasks = [translate_one(cls) for cls in to_translate]
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, (result, success) in enumerate(batch_results):
-        cls = to_translate[i]
-
-        if isinstance(result, Exception) or not success:
-            error_msg = str(result) if isinstance(result, Exception) else "Unknown error"
-            print(f"       [M6] FAILED [{cls.block_id}]: {error_msg}")
-            results.append(TranslationResult(
-                block_id=cls.block_id,
-                doc_id=cls.doc_id,
-                original_text=cls.original_content,
-                translated_text="",
-                status="REVIEW_NEEDED",
-            ))
+    failures: list[str] = []
+    for item, raw_result in zip(selected, raw_results, strict=True):
+        if isinstance(raw_result, Exception):
+            failures.append(f"{item.block_id}: {raw_result}")
         else:
-            status = "OK" if result and len(result) > 5 else "REVIEW_NEEDED"
-
-            translation_result = TranslationResult(
-                block_id=cls.block_id,
-                doc_id=cls.doc_id,
-                original_text=cls.original_content,
-                translated_text=result,
-                status=status,
-            )
-            results.append(translation_result)
-
-            if status == "REVIEW_NEEDED":
-                print(f"       WARNING: Translation may need review")
-
-    # Sort results by block_id to maintain original order
-    results.sort(key=lambda x: x.block_id)
-
-    return results
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def translate_batch(classifications: list[ClassificationResult]) -> list[TranslationResult]:
-    """Translate EE-related requirement statements (sequential, for compatibility).
-
-    Only translates blocks where is_requirement=True AND is_ee_related=True.
-
-    Args:
-        classifications: List of ClassificationResult from M5.
-
-    Returns:
-        List of TranslationResult objects.
-    """
-    results: list[TranslationResult] = []
-    to_translate = [c for c in classifications if c.is_requirement and c.is_ee_related]
-
-    print(f"[M6] Translating {len(to_translate)} EE requirements...")
-
-    for i, cls in enumerate(to_translate):
-        print(f"[M6] Translating [{cls.block_id}] ({i+1}/{len(to_translate)})...")
-
-        try:
-            translated = _translate_single(cls.original_content)
-
-            status = "OK" if translated and len(translated) > 5 else "REVIEW_NEEDED"
-
-            result = TranslationResult(
-                block_id=cls.block_id,
-                doc_id=cls.doc_id,
-                original_text=cls.original_content,
-                translated_text=translated,
-                status=status,
-            )
+            translated, success = raw_result
+            if not success:
+                failures.append(f"{item.block_id}: translation failed after retries")
+                continue
+            result = _translation_result(item, translated, success)
+            if result.status == "REVIEW_NEEDED":
+                failures.append(f"{item.block_id}: unusable translation")
+                continue
             results.append(result)
-
-            if status == "REVIEW_NEEDED":
-                print(f"       WARNING: Translation may need review")
-
-        except Exception as e:
-            print(f"       FAILED: {e}")
-            results.append(TranslationResult(
-                block_id=cls.block_id,
-                doc_id=cls.doc_id,
-                original_text=cls.original_content,
-                translated_text="",
-                status="REVIEW_NEEDED",
-            ))
-
+    if failures:
+        sample = "; ".join(failures[:5])
+        raise RuntimeError(
+            f"ChatT translation failed for {len(failures)} record(s); "
+            f"no translation artifact was written. Examples: {sample}"
+        )
     return results
 
 
-def _translate_single(text: str) -> str:
-    """Call ChatT API for a single translation (sync version)."""
-    payload = _build_translation_payload(text)
+def _translate_single(text: str, config: PipelineConfig | None = None) -> str:
+    """Synchronous one-shot compatibility helper."""
+    settings = config or PipelineConfig()
+    validate_chatt_config(settings)
+    payload = _build_translation_payload(
+        text,
+        model=settings.chatt_model,
+        system_prompt=settings.translation_system_prompt,
+        prompt_template=settings.translation_prompt,
+    )
+    with httpx.Client(timeout=settings.request_timeout, follow_redirects=True) as client:
+        return request_chat_completion_sync(client, settings, payload)
 
-    url = f"{CHATT_BASE_URL.rstrip('/')}/v1/chat/completions"
 
-    headers = {
-        "Authorization": f"Bearer {CHATT_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    with httpx.Client(timeout=60.0) as client:
-        response = client.post(url, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-    choices = data.get("choices", [])
-    if not choices:
-        raise ValueError("No choices in LLM response")
-
-    content = choices[0].get("message", {}).get("content")
-    if content is None:
-        raise ValueError("LLM returned None content")
-    return content.strip()
+def translate_batch(
+    classifications: list[ClassificationResult],
+    config: PipelineConfig | None = None,
+) -> list[TranslationResult]:
+    """Synchronous compatibility wrapper with per-item error isolation."""
+    settings = config or PipelineConfig()
+    return asyncio.run(translate_batch_parallel(classifications, settings.max_concurrency, config=settings))
 
 
 async def run(config: PipelineConfig, classifications: list[ClassificationResult]) -> list[TranslationResult]:
-    """Execute M6: translate EE requirements.
-
-    Uses parallel processing with bounded concurrency.
-    Returns list of TranslationResult objects.
-    Writes translated.jsonl to output.
-    """
-    import time as _time
-    t0 = _time.time()
-    results = await translate_batch_parallel(classifications, max_concurrency=8)
-    m6_elapsed = _time.time() - t0
-
-    translated_path = config.run_dir / "translated.jsonl"
-    with open(translated_path, "w", encoding="utf-8") as f:
-        for r in results:
-            f.write(r.model_dump_json() + "\n")
-
-    ok_count = sum(1 for r in results if r.status == "OK")
-    review_count = sum(1 for r in results if r.status == "REVIEW_NEEDED")
-
-    print(f"[M6] {len(results)} translated | OK: {ok_count} | Review needed: {review_count}")
-    print(f"[M6] Elapsed: {m6_elapsed:.2f}s ({m6_elapsed/max(len(results),1)*1000:.0f}ms/batch)")
+    """Execute M6 and persist ``translated.jsonl``."""
+    config.prepare_run_dir()
+    started = time.perf_counter()
+    results = await translate_batch_parallel(classifications, config.max_concurrency, config=config)
+    elapsed = time.perf_counter() - started
+    path = write_jsonl(config.run_dir / "translated.jsonl", results)
+    ok_count = sum(result.status == "OK" for result in results)
+    print(f"[M6] {len(results)} translated | OK: {ok_count} | Review needed: {len(results) - ok_count}")
+    print(f"[M6] Elapsed: {elapsed:.2f}s | {path}")
     return results

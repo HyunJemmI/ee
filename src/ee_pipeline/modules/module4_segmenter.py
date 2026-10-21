@@ -1,474 +1,494 @@
-"""M4: Requirement Segmenter — splits chunks into individual requirement candidates.
-
-Breaks combined chunk content into individual text segments that can be
-classified by the LLM. Each segment becomes a candidate for M5 classification.
-
-Features:
-- Context-based merging of short segments (<=500 chars) into ~1200-2000 char batches
-- Conservative skip_candidate marking for obvious metadata only
-- Full provenance tracking (heading_index, source_start_line, source_end_line)
-- Same-document, adjacent-segment merging only
-"""
+"""M4: split contextual chunks into requirement candidates and merge short context."""
 
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
+from collections.abc import Mapping
+from typing import Any
 
 from ..config import PipelineConfig
-from ..models import DocumentBlock
+from ..io_utils import write_jsonl
+from ..models import ChunkedBlock
+
+SKIP_THRESHOLD = 5
+MERGE_THRESHOLD = 500
+MERGE_TARGET_MIN = 1200
+MERGE_TARGET_MAX = 2000
 
 
-# ---------------------------------------------------------------------------
-# Metadata scoring system
-# ---------------------------------------------------------------------------
-
-# Scoring thresholds
-SKIP_THRESHOLD = 5          # Score >= this -> skip_candidate
-BLOCKING_THRESHOLD = 0      # Any blocking signal -> no skip regardless of score
-
-# Blocking signals -- if ANY match, the segment MUST NOT be skipped
-BLOCKING_SIGNALS = [
+_SIGNAL_TERMS = (
     r"\bshall\b", r"\bmust\b", r"\brequired\b", r"\bneed to\b",
     r"\bcomply\b", r"\bverify\b", r"\btest\b", r"\bacceptance\b",
     r"\btolerance\b", r"\bvalidation\b", r"\bapproval\b",
-    r"\b\ub3c4\uad6c\b", r"\b\uc2dc\ud5d8\b", r"\b\uac80\uc99d\b",
-    r"\b\uae30\uc900\b", r"\b\ud5c8\uc6a9\b", r"\b\uae40\uc9c0\b",
-    r"\b\uacf5\ucc2c\b", r"\b\ud310\uc815\b", r"\b\uc218\uce58\b",
-]
+    r"\bmaximum\b", r"\bminimum\b", r"\blimit\b", r"\bnot exceed\b",
+    r"도구", r"시험", r"검증", r"기준", r"허용", r"공차", r"판정", r"수치",
+)
+_SIGNAL_PATTERN = re.compile("|".join(_SIGNAL_TERMS), re.IGNORECASE)
+BLOCKING_SIGNALS = list(_SIGNAL_TERMS)
+REQUIREMENT_SIGNALS = list(_SIGNAL_TERMS)
+_BOILERPLATE_HEADING_PATTERN = re.compile(
+    r"^(?:\d+(?:\.\d+)*\s+)?(?:legal information|legal disclaimer|disclaimer|contents|table of contents|"
+    r"revision history|change history|document history|document feedback|suitability for use|limitation of liability|"
+    r"warranty disclaimer|limited warranty|document status|product status|terms and conditions|export control)\s*[:.]?$",
+    re.IGNORECASE,
+)
+_LEGAL_BOILERPLATE_PATTERN = re.compile(
+    r"\b(?:copyright|all rights reserved|limitation of liability|warranty disclaimer|limited warranty|"
+    r"suitability for use|terms and conditions|export control)\b",
+    re.IGNORECASE,
+)
 
-# Scoring patterns -- each adds points toward skip
-# (+) = adds to metadata_score
-# (-) = subtracts from metadata_score
-_METADATA_SCORE_RULES = [
-    # (+3) Page number only
-    (r"^\d{1,3}$", 3, "page_number_only"),
-    # (+2) Standard document header
-    (r"^(TABLE OF CONTENTS|REVISION HISTORY|DEFINITIONS|ABBREVIATIONS|REFERENCES|CONTENTS)$", 2, "standard_header"),
-    # (+2) Regulation/standard label
-    (r"^(ISO|IEC|SAE|JIS|DIN|ANSI|ECE|UN)\s*\d+[\.\-]?\w*$", 2, "regulation_label"),
-    # (+2) Repeated copyright/confidential
-    (r"^(COPYRIGHT|CONFIDENTIAL|ALL RIGHTS RESERVED|PROPERTY OF|DISTRIBUTION:)", 2, "copyright_confidential"),
-    # (+2) Version/revision marker
-    (r"^(v\d+[\.\d]*|Rev\.\s*\d+[\.\d]*)$", 2, "version_marker"),
-    # (+1) Boundary position (first/last segment of document)
-    (r"^(Page|PAGE|p\.|p\. )\s*\d+", 1, "page_boundary"),
-    # (+1) Very short text
-    (r"^.{1,20}$", 1, "very_short"),
-    # (-5) Requirement signal present
-    (r"\bshall\b|\bmust\b|\brequired\b|\bneed to\b|\bcomply\b|\bverify\b|\btest\b|\bacceptance\b|\btolerance\b|\bvalidation\b|\bapproval\b|\b\ub3c4\uad6c\b|\b\uc2dc\ud5d8\b|\b\uac80\uc99d\b|\b\uae30\uc900\b|\b\ud5c8\uc6a9\b|\b\uae40\uc9c0\b|\b\uacf5\ucc2c\b|\b\ud310\uc815\b|\b\uc218\uce58\b", -5, "requirement_signal"),
-    # (-5) Test/judgment/numeric criteria
-    (r"(\uc2dc\ud5d8|\ud310\uc815|\ud5c8\uc6a9|\uacf5\ucc2c|\uae30\uc900|\uc218\uce58|\uac80\uc0ac|\ucc4c\uc815|\ud3b0\uac00|\u5224\u5b9a|\u8a66\u9a13|\u57fa\u6e96|\u8a31\u5bb9|\u516c\u5dee)", -5, "test_criteria"),
-    # (-4) Table context
-    (r"^\|.*\|$", -4, "table_row"),
-    # (-3) Technical heading context
-    (r"^(3\.\d+|4\.\d+|5\.\d+|6\.\d+|7\.\d+|8\.\d+|9\.\d+)\s+[A-Z]", -3, "technical_heading"),
-]
+_METADATA_SCORE_RULES: tuple[tuple[re.Pattern[str], int, str], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), points, label)
+    for pattern, points, label in (
+        (r"^\d{1,3}$", 3, "page_number_only"),
+        (r"^(TABLE OF CONTENTS|REVISION HISTORY|DEFINITIONS|ABBREVIATIONS|REFERENCES|CONTENTS)$", 2, "standard_header"),
+        (r"^(ISO|IEC|SAE|JIS|DIN|ANSI|ECE|UN)\s*\d+[.\-]?\w*$", 2, "regulation_label"),
+        (r"^(COPYRIGHT|CONFIDENTIAL|ALL RIGHTS RESERVED|PROPERTY OF|DISTRIBUTION:)", 2, "copyright_confidential"),
+        (r"^(v\d+[.\d]*|Rev\.\s*\d+[.\d]*)$", 2, "version_marker"),
+        (r"^(Page|PAGE|p\.)\s*\d+", 1, "page_boundary"),
+        (r"^.{1,20}$", 1, "very_short"),
+        ("|".join(_SIGNAL_TERMS), -5, "requirement_signal"),
+        (r"(시험|판정|허용|공차|기준|수치|검사|測定|評価|判定|試験|基準|許容|公差)", -5, "test_criteria"),
+        (r"^\|.*\|$", -4, "table_row"),
+        (r"^(?:3|4|5|6|7|8|9)\.\d+\s+[A-Z]", -3, "technical_heading"),
+    )
+)
 
-
-# ---------------------------------------------------------------------------
-# Merge configuration
-# ---------------------------------------------------------------------------
-
-MERGE_THRESHOLD = 500        # Short segment threshold (chars)
-MERGE_TARGET_MIN = 1200      # Target merged size (chars)
-MERGE_TARGET_MAX = 2000      # Max merged size (chars)
-
-# Requirement signal keywords (any match = keep for M5) -- kept for backward compatibility
-REQUIREMENT_SIGNALS = [
-    r"\bshall\b", r"\bmust\b", r"\brequired\b", r"\bneed to\b",
-    r"\bcomply\b", r"\bverify\b", r"\btest\b", r"\bacceptance\b",
-    r"\btolerance\b", r"\bvalidation\b", r"\bapproval\b",
-    r"\b\ub3c4\uad6c\b", r"\b\uc2dc\ud5d8\b", r"\b\uac80\uc99d\b",
-    r"\b\uae30\uc900\b", r"\b\ud5c8\uc6a9\b", r"\b\uae40\uc9c0\b",
-]
-
-
-# ---------------------------------------------------------------------------
-# Metadata detection helpers
-# ---------------------------------------------------------------------------
 
 def _has_blocking_signal(content: str) -> bool:
-    """Check if content contains any blocking signal (must NOT skip)."""
-    for sig in BLOCKING_SIGNALS:
-        if re.search(sig, content, re.IGNORECASE):
-            return True
-    return False
+    """Return true when content contains a signal that must reach the LLM."""
+    return bool(_SIGNAL_PATTERN.search(content))
 
 
 def _compute_metadata_score(content: str) -> tuple[int, str]:
-    """Compute a metadata score for a segment.
-
-    Returns:
-        (score, reason) -- score >= SKIP_THRESHOLD means skip_candidate
-    """
-    content = content.strip()
-    if not content:
-        return 10, "empty_content"  # Empty is always metadata
-
-    # Blocking check -- if any blocking signal found, return immediately
-    if _has_blocking_signal(content):
+    """Score obvious document metadata; requirement-like text is protected."""
+    text = content.strip()
+    if not text:
+        return 10, "empty_content"
+    if _BOILERPLATE_HEADING_PATTERN.fullmatch(text) or _LEGAL_BOILERPLATE_PATTERN.search(text):
+        return 10, "document_boilerplate"
+    if _has_blocking_signal(text):
         return -100, "blocking_signal"
 
     score = 0
-    reasons = []
-
+    reasons: list[str] = []
     for pattern, points, label in _METADATA_SCORE_RULES:
-        if re.search(pattern, content, re.IGNORECASE):
+        if pattern.search(text):
             score += points
-            reasons.append(f"{label}(+{points})")
-
-    reason = "; ".join(reasons) if reasons else "no_match"
-    return score, reason
+            reasons.append(f"{label}({points:+d})")
+    return score, "; ".join(reasons) if reasons else "no_match"
 
 
-def _is_metadata_segment(segment: dict) -> tuple[bool, str | None]:
-    """Determine if a segment is metadata (should be skipped).
-
-    Uses blocking signals and metadata scoring to decide.
-    Returns (is_metadata, skip_reason).
-    """
-    content = segment.get("content", "")
-    if _has_blocking_signal(content):
-        return False, None
-
-    score, reason = _compute_metadata_score(content)
-    if score >= SKIP_THRESHOLD:
-        return True, reason
-    return False, None
+def _is_metadata_segment(segment: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Return whether a segment should be skipped before classification."""
+    score, reason = _compute_metadata_score(str(segment.get("content", "")))
+    return (score >= SKIP_THRESHOLD, reason if score >= SKIP_THRESHOLD else None)
 
 
-# ---------------------------------------------------------------------------
-# Segment splitting
-# ---------------------------------------------------------------------------
+def _value(source: Any, key: str, default: Any = None) -> Any:
+    return source.get(key, default) if isinstance(source, Mapping) else getattr(source, key, default)
 
-def _split_into_segments(content: str, heading: str | None = None,
-                         chunk_provenance: dict | None = None) -> list[dict]:
-    """Split chunk content into individual requirement candidates.
 
-    Uses sentence-level splitting with context preservation.
-    Each segment includes its heading context and provenance tracking.
-    """
-    if not content.strip():
+def _split_into_segments(
+    content: str,
+    heading: str | None = None,
+    chunk_provenance: Mapping[str, Any] | None = None,
+    *,
+    segment_prefix: str = "seg",
+) -> list[dict[str, Any]]:
+    """Split a chunk into paragraph candidates and attach provenance."""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", content.strip()) if part.strip()]
+    if not paragraphs:
         return []
 
-    # Split by double newlines (paragraph boundaries)
-    paragraphs = re.split(r"\n\s*\n+", content.strip())
-
-    segments: list[dict] = []
-    for i, para in enumerate(paragraphs):
-        para = para.strip()
-        if not para or len(para) < 10:
-            continue
-
-        # Determine line range for this segment
-        start_line = None
-        end_line = None
-        if chunk_provenance and chunk_provenance.get("source_line_ranges"):
-            line_ranges = chunk_provenance["source_line_ranges"]
-            if i < len(line_ranges):
-                start_line = line_ranges[i].get("start_line")
-                end_line = line_ranges[i].get("end_line")
-
-        segment = {
-            "segment_id": f"seg_{i+1:03d}",
+    provenance = chunk_provenance or {}
+    line_ranges = provenance.get("source_line_ranges", [])
+    block_type = str(provenance.get("block_type", "paragraph"))
+    section_role = str(provenance.get("section_role", "content"))
+    candidate_type = "spec_table" if block_type == "table" else "paragraph"
+    section_text = f"{heading or ''} {provenance.get('heading_text') or ''}"
+    hard_metadata_context = bool(_BOILERPLATE_HEADING_PATTERN.fullmatch(section_text.strip()))
+    if (
+        block_type in {"metadata", "header", "footer"}
+        or section_role in {"boilerplate", "support"}
+        or hard_metadata_context
+    ):
+        candidate_type = "metadata"
+    elif block_type == "figure":
+        candidate_type = "figure"
+    base_candidate_type = candidate_type
+    segments: list[dict[str, Any]] = []
+    for index, paragraph in enumerate(paragraphs, start=1):
+        candidate_type = base_candidate_type
+        source_range = line_ranges[min(index - 1, len(line_ranges) - 1)] if line_ranges else {}
+        segment: dict[str, Any] = {
+            "segment_id": f"{segment_prefix}_{index:05d}",
             "heading": heading,
-            "content": para,
-            "length": len(para),
+            "content": paragraph,
+            "length": len(paragraph),
             "skip_candidate": False,
             "skip_reason": None,
+            "document_id": provenance.get("document_id", ""),
+            "heading_index": provenance.get("heading_index"),
+            "heading_text": provenance.get("heading_text") or heading,
+            "source_file": provenance.get("source_file", ""),
+            "source_start_line": source_range.get("start_line"),
+            "source_end_line": source_range.get("end_line"),
+            "source_block_id": provenance.get("source_block_id", ""),
+            "page_number": provenance.get("page_number"),
+            "source_bbox": provenance.get("source_bbox"),
+            "parent_heading": provenance.get("parent_heading", heading or ""),
+            "block_type": block_type,
+            "section_role": section_role,
+            "source_unit_id": provenance.get("source_unit_id"),
+            "candidate_type": candidate_type,
+            "table_id": provenance.get("table_id"),
+            "table_title": provenance.get("table_title"),
+            "table_headers": provenance.get("table_headers", []),
+            "table_row_index": provenance.get("table_row_index"),
+            "record_id": provenance.get("record_id"),
         }
+        if (
+            candidate_type not in {"figure", "metadata"}
+            and section_role in {"metadata", "front_matter"}
+            and not _has_blocking_signal(paragraph)
+        ):
+            segment["candidate_type"] = "metadata"
+            candidate_type = "metadata"
 
-        # Add provenance tracking
-        if chunk_provenance:
-            segment.update({
-                "document_id": chunk_provenance.get("document_id", ""),
-                "heading_index": chunk_provenance.get("heading_index"),
-                "heading_text": chunk_provenance.get("heading_text"),
-                "source_start_line": start_line,
-                "source_end_line": end_line,
-                "parent_heading": chunk_provenance.get("parent_heading"),
-            })
-
-        # Check for metadata
-        is_metadata, skip_reason = _is_metadata_segment(segment)
+        if candidate_type == "figure":
+            segment["skip_candidate"] = True
+            segment["skip_reason"] = "figure"
+        elif candidate_type == "metadata":
+            segment["skip_candidate"] = True
+            segment["skip_reason"] = (
+                "supporting_material"
+                if section_role == "support"
+                else "document_boilerplate"
+                if section_role == "boilerplate"
+                else "document_metadata"
+            )
+        elif (
+            not re.search(r"[A-Za-z]{2,}", paragraph)
+            and not _has_blocking_signal(paragraph)
+            and candidate_type != "spec_table"
+        ):
+            segment["skip_candidate"] = True
+            segment["skip_reason"] = "layout_fragment"
+        is_metadata, reason = _is_metadata_segment(segment)
         if is_metadata:
             segment["skip_candidate"] = True
-            segment["skip_reason"] = skip_reason
-
+            segment["skip_reason"] = reason
         segments.append(segment)
-
     return segments
 
 
-# ---------------------------------------------------------------------------
-# Context-based merging
-# ---------------------------------------------------------------------------
+def _build_batch(batch_segments: list[dict[str, Any]], doc_id: str, batch_index: int | None = None) -> dict[str, Any]:
+    """Create a serializable batch with complete source traceability."""
+    source_segments: list[dict[str, Any]] = []
+    merged_parts: list[str] = []
+    heading_indices: list[int] = []
+    line_ranges: list[dict[str, Any]] = []
 
-def _merge_short_segments(segments: list[dict]) -> list[dict]:
-    """Merge short segments (<=500 chars) with adjacent segments for context.
-
-    Rules:
-    - Only merge within the same document_id
-    - Only merge adjacent segments (by source_start_line order)
-    - Do not cross document boundaries, page boundaries, or major topic shifts
-    - skip_candidate segments are preserved separately (not merged into content)
-    - Merged batch target: ~1200-2000 chars
-
-    Returns:
-        List of merged batch dicts with full provenance tracking.
-    """
-    if not segments:
-        return []
-
-    # Sort by document_id then source_start_line to ensure correct order
-    segments.sort(key=lambda s: (
-        s.get("document_id", ""),
-        s.get("source_start_line", 0) or 0,
-    ))
-
-    batches: list[dict] = []
-    current_batch: list[dict] = []
-    current_doc_id: str | None = None
-    current_heading: str | None = None
-
-    for seg in segments:
-        seg_doc_id = seg.get("document_id", "")
-        seg_heading = seg.get("heading")
-        seg_content = seg.get("content", "")
-        seg_length = len(seg_content)
-        is_skip = seg.get("skip_candidate", False)
-
-        # Initialize current_doc_id from first segment
-        if current_doc_id is None:
-            current_doc_id = seg_doc_id
-            current_heading = seg_heading
-
-        # Check document boundary -- start new batch
-        if seg_doc_id != current_doc_id:
-            if current_batch:
-                batches.append(_build_batch(current_batch, current_doc_id))
-                current_batch = []
-            current_doc_id = seg_doc_id
-            current_heading = seg_heading
-
-        # Check heading/topic boundary -- start new batch if major shift
-        if (current_batch and
-            current_heading is not None and
-            seg_heading is not None and
-            seg_heading != current_heading and
-            len(current_batch) > 0):
-            # Only split if the current batch already has content
-            current_content_len = sum(
-                s.get("length", 0) for s in current_batch if not s.get("skip_candidate")
-            )
-            if current_content_len >= MERGE_TARGET_MIN:
-                batches.append(_build_batch(current_batch, current_doc_id))
-                current_batch = []
-                current_heading = seg_heading
-
-        # Handle skip_candidate segments -- keep separate, don't merge into content
-        if is_skip:
-            if current_batch:
-                batches.append(_build_batch(current_batch, current_doc_id))
-                current_batch = []
-            # Add skip segment as its own batch
-            batches.append(_build_batch([seg], current_doc_id))
-            continue
-
-        # Merge logic for non-skip segments
-        current_content_len = sum(
-            s.get("length", 0) for s in current_batch if not s.get("skip_candidate")
+    for segment in batch_segments:
+        source_segments.append(
+            {
+                "segment_id": segment.get("segment_id", ""),
+                "heading_index": segment.get("heading_index"),
+                "heading_text": segment.get("heading_text") or segment.get("heading"),
+                "source_file": segment.get("source_file", ""),
+                "source_start_line": segment.get("source_start_line"),
+                "source_end_line": segment.get("source_end_line"),
+                "source_block_id": segment.get("source_block_id", ""),
+                "page_number": segment.get("page_number"),
+                "source_bbox": segment.get("source_bbox"),
+                "segment_text": segment.get("content", ""),
+                "skip_candidate": bool(segment.get("skip_candidate")),
+                "skip_reason": segment.get("skip_reason"),
+                "candidate_type": segment.get("candidate_type", "paragraph"),
+                "block_type": segment.get("block_type", "paragraph"),
+                "section_role": segment.get("section_role", "content"),
+                "source_unit_id": segment.get("source_unit_id"),
+                "table_id": segment.get("table_id"),
+                "table_title": segment.get("table_title"),
+                "table_headers": segment.get("table_headers", []),
+                "table_row_index": segment.get("table_row_index"),
+                "record_id": segment.get("record_id"),
+            }
         )
+        if segment.get("heading_index") is not None:
+            heading_indices.append(segment["heading_index"])
+        if segment.get("source_start_line") is not None:
+            line_ranges.append(
+                {
+                    "start_line": segment.get("source_start_line"),
+                    "end_line": segment.get("source_end_line"),
+                }
+            )
+        if not segment.get("skip_candidate"):
+            if segment.get("heading") and not merged_parts:
+                merged_parts.append(f"[Heading: {segment['heading']}]")
+            if segment.get("table_title") and not any(
+                part.startswith("[Table: ") for part in merged_parts
+            ):
+                merged_parts.append(f"[Table: {segment['table_title']}]")
+            merged_parts.append(segment.get("content", ""))
 
-        if not current_batch:
-            # First segment in batch
-            current_batch.append(seg)
-            current_heading = seg_heading
-        elif seg_length <= MERGE_THRESHOLD and (current_content_len + seg_length) <= MERGE_TARGET_MAX:
-            # Short segment + fits in target -> merge
-            current_batch.append(seg)
-        elif current_content_len >= MERGE_TARGET_MIN:
-            # Current batch is large enough -> flush and start new
-            batches.append(_build_batch(current_batch, current_doc_id))
-            current_batch = [seg]
-            current_heading = seg_heading
-        else:
-            # Current batch not big enough, but adding this segment would exceed target
-            # Flush current batch and start new with this segment
-            batches.append(_build_batch(current_batch, current_doc_id))
-            current_batch = [seg]
-            current_heading = seg_heading
-
-    # Flush remaining
-    if current_batch:
-        batches.append(_build_batch(current_batch, current_doc_id))
-
-    return batches
-
-
-def _build_batch(batch_segments: list[dict], doc_id: str) -> dict:
-    """Build a merged batch dict with full provenance tracking."""
-    # Build merged text (skip_candidate segments excluded from merged text)
-    merged_parts = []
-    source_segments = []
-    source_segment_ids = []
-    source_heading_indices = []
-    source_line_ranges = []
-
-    for seg in batch_segments:
-        seg_id = seg.get("segment_id", "")
-        seg_heading = seg.get("heading", "")
-        seg_content = seg.get("content", "")
-        seg_start = seg.get("source_start_line")
-        seg_end = seg.get("source_end_line")
-        seg_heading_idx = seg.get("heading_index")
-        is_skip = seg.get("skip_candidate", False)
-
-        # Include in source tracking always
-        source_segments.append({
-            "segment_id": seg_id,
-            "heading_index": seg_heading_idx,
-            "heading_text": seg_heading,
-            "source_start_line": seg_start,
-            "source_end_line": seg_end,
-            "segment_text": seg_content,
-            "skip_candidate": is_skip,
-            "skip_reason": seg.get("skip_reason"),
-        })
-        source_segment_ids.append(seg_id)
-        if seg_heading_idx is not None:
-            source_heading_indices.append(seg_heading_idx)
-        if seg_start is not None:
-            source_line_ranges.append({
-                "start_line": seg_start,
-                "end_line": seg_end,
-            })
-
-        # Include in merged text only if not skip_candidate
-        if not is_skip:
-            if seg_heading and not merged_parts:
-                merged_parts.append(f"[Heading: {seg_heading}]")
-            merged_parts.append(seg_content)
-
-    merged_text = "\n\n".join(merged_parts)
-
-    # Determine processing status
-    all_skip = all(s.get("skip_candidate", False) for s in batch_segments)
-    if all_skip:
-        processing_status = "skip_candidate"
+    source_ids = [segment["segment_id"] for segment in source_segments]
+    all_skip = bool(source_segments) and all(segment["skip_candidate"] for segment in source_segments)
+    first_source_line = min(
+        (item["start_line"] for item in line_ranges if item.get("start_line") is not None),
+        default=None,
+    )
+    first_heading_index = min(heading_indices, default=None)
+    headings = list(
+        dict.fromkeys(
+            segment.get("heading_text") or segment.get("heading")
+            for segment in batch_segments
+            if segment.get("heading_text") or segment.get("heading")
+        )
+    )
+    page_numbers = sorted(
+        {
+            int(segment["page_number"])
+            for segment in batch_segments
+            if segment.get("page_number") is not None
+        }
+    )
+    table_ids = list(
+        dict.fromkeys(segment.get("table_id") for segment in batch_segments if segment.get("table_id"))
+    )
+    table_titles = list(
+        dict.fromkeys(segment.get("table_title") for segment in batch_segments if segment.get("table_title"))
+    )
+    record_ids = list(
+        dict.fromkeys(segment.get("record_id") for segment in batch_segments if segment.get("record_id"))
+    )
+    source_unit_ids = list(
+        dict.fromkeys(
+            segment.get("source_unit_id")
+            for segment in batch_segments
+            if segment.get("source_unit_id")
+        )
+    )
+    if batch_index is None:
+        batch_id = f"batch_{source_ids[0]}" if source_ids else "batch_empty"
     else:
-        processing_status = "processed"
-
-    # Find first heading_index and source_line for ordering
-    first_heading_idx = None
-    first_source_line = None
-    for sr in source_line_ranges:
-        if sr.get("start_line") is not None:
-            if first_source_line is None or sr["start_line"] < first_source_line:
-                first_source_line = sr["start_line"]
-    for hi in source_heading_indices:
-        if first_heading_idx is None or hi < first_heading_idx:
-            first_heading_idx = hi
+        batch_id = f"batch_{batch_index:04d}"
 
     return {
         "document_id": doc_id,
-        "batch_id": f"batch_{len(batch_segments):03d}",
-        "processing_status": processing_status,
+        "batch_id": batch_id,
+        "processing_status": "skip_candidate" if all_skip else "processed",
         "skip_candidate": all_skip,
-        "skip_reason": batch_segments[0].get("skip_reason") if all_skip else None,
-        "merged_text": merged_text,
+        "skip_reason": source_segments[0].get("skip_reason") if all_skip else None,
+        "candidate_type": (
+            source_segments[0].get("candidate_type", "paragraph")
+            if source_segments
+            else "paragraph"
+        ),
+        "heading": headings[0] if len(headings) == 1 else " > ".join(headings) if headings else None,
+        "heading_index": first_heading_index,
+        "page_numbers": page_numbers,
+        "source_file": source_segments[0].get("source_file", "") if source_segments else "",
+        "table_id": table_ids[0] if len(table_ids) == 1 else None,
+        "table_title": table_titles[0] if len(table_titles) == 1 else None,
+        "record_id": record_ids[0] if len(record_ids) == 1 else None,
+        "source_unit_id": source_unit_ids[0] if len(source_unit_ids) == 1 else None,
+        "merged_text": "\n\n".join(merged_parts),
         "source_segments": source_segments,
-        "source_segment_ids": source_segment_ids,
-        "source_heading_indices": source_heading_indices,
-        "source_line_ranges": source_line_ranges,
+        "source_segment_ids": source_ids,
+        "source_heading_indices": heading_indices,
+        "source_line_ranges": line_ranges,
         "processing_order": {
-            "first_heading_index": first_heading_idx,
+            "first_heading_index": first_heading_index,
             "first_source_line": first_source_line,
         },
     }
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _merge_short_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge adjacent short segments without crossing document boundaries."""
+    if not segments:
+        return []
 
-def segment_chunks(chunks: list) -> list[dict]:
-    """Segment all chunks into individual requirement candidates, then merge short ones.
+    ordered = sorted(
+        (dict(segment) for segment in segments),
+        key=lambda segment: (
+            segment.get("document_id", ""),
+            segment.get("page_number") or 0,
+            segment.get("source_start_line") or 0,
+            segment.get("segment_id", ""),
+        ),
+    )
+    batches: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    current_doc_id: str | None = None
+    current_heading: str | None = None
+    current_type: str | None = None
+    current_table_id: str | None = None
+    current_record_id: str | None = None
+    current_source_unit_id: str | None = None
 
-    Args:
-        chunks: List of ChunkedBlock objects or dicts with 'combined_content' and 'heading_hierarchy'.
+    def flush() -> None:
+        nonlocal current
+        if current:
+            batches.append(_build_batch(current, current_doc_id or ""))
+            current = []
 
-    Returns:
-        List of merged batch dicts ready for LLM classification with provenance tracking.
-    """
-    # Step 1: Split all chunks into segments
-    all_segments: list[dict] = []
+    for segment in ordered:
+        doc_id = segment.get("document_id", "")
+        heading = segment.get("heading")
+        if current_doc_id is None:
+            current_doc_id, current_heading = doc_id, heading
+            current_type = segment.get("candidate_type")
+            current_table_id = segment.get("table_id")
+            current_record_id = segment.get("record_id")
+            current_source_unit_id = segment.get("source_unit_id")
+        elif doc_id != current_doc_id:
+            flush()
+            current_doc_id, current_heading = doc_id, heading
+            current_type = segment.get("candidate_type")
+            current_table_id = segment.get("table_id")
+            current_record_id = segment.get("record_id")
+            current_source_unit_id = segment.get("source_unit_id")
 
-    for chunk in chunks:
-        # Check if chunk is a dict (from JSONL) or object (from pipeline)
-        if isinstance(chunk, dict):
-            content = chunk.get("combined_content", "")
-            heading = chunk.get("heading_hierarchy", "")
-            # Extract document_id from blocks (dict format)
-            doc_id = ""
-            if chunk.get("blocks"):
-                first_block = chunk["blocks"][0]
-                if isinstance(first_block, dict):
-                    doc_id = first_block.get("doc_id", "")
-                else:
-                    doc_id = getattr(first_block, "doc_id", "")
-            chunk_provenance = {
-                "document_id": doc_id,
-                "heading_index": chunk.get("heading_index"),
-                "heading_text": chunk.get("heading_text"),
-                "source_line_ranges": chunk.get("source_line_ranges", []),
-                "parent_heading": heading,
-            }
-        elif hasattr(chunk, 'combined_content'):
-            content = chunk.combined_content
-            heading = chunk.heading_hierarchy
-            chunk_provenance = {
-                "document_id": chunk.blocks[0].doc_id if chunk.blocks else "",
-                "heading_index": chunk.source_heading_indices[0] if chunk.source_heading_indices else None,
-                "heading_text": chunk.blocks[0].heading if chunk.blocks and chunk.blocks[0].heading else None,
-                "source_line_ranges": chunk.source_line_ranges,
-                "parent_heading": heading,
-            }
-        else:
+        if segment.get("skip_candidate"):
+            flush()
+            batches.append(_build_batch([segment], doc_id))
+            current_heading = heading
             continue
 
-        segments = _split_into_segments(content, heading, chunk_provenance)
-        all_segments.extend(segments)
+        current_length = sum(len(item.get("content", "")) for item in current)
+        candidate_type = segment.get("candidate_type")
+        table_id = segment.get("table_id")
+        record_id = segment.get("record_id")
+        source_unit_id = segment.get("source_unit_id")
+        topic_changed = bool(
+            current
+            and (
+                heading != current_heading
+                or (current_type and candidate_type and candidate_type != current_type)
+                or (current_table_id and table_id and table_id != current_table_id)
+                or (current_record_id and record_id and record_id != current_record_id)
+                or (record_id and current and record_id != current_record_id)
+                or (
+                    (current_source_unit_id is not None or source_unit_id is not None)
+                    and source_unit_id != current_source_unit_id
+                )
+            )
+        )
+        if current and (
+            topic_changed
+            or (
+            (
+                current_length >= MERGE_TARGET_MIN
+                and len(segment.get("content", "")) > MERGE_THRESHOLD
+            )
+            or current_length + len(segment.get("content", "")) > MERGE_TARGET_MAX
+            )
+        ):
+            flush()
 
-    # Step 2: Merge short segments
-    batches = _merge_short_segments(all_segments)
+        if not current:
+            current_heading = heading
+            current_type = candidate_type
+            current_table_id = table_id
+            current_record_id = record_id
+            current_source_unit_id = source_unit_id
+        current.append(segment)
 
+    flush()
     return batches
 
 
-def run(config: PipelineConfig, chunks: list[dict]) -> list[dict]:
-    """Execute M4: segment chunks, merge short ones, and output batches.
+def _chunk_segments(
+    chunk: ChunkedBlock | Mapping[str, Any],
+    chunk_index: int,
+) -> list[dict[str, Any]]:
+    """Create typed segments from each source block instead of a chunk-wide type."""
+    parent_heading = str(_value(chunk, "heading_hierarchy", "") or "")
+    raw_blocks = _value(chunk, "blocks", []) or []
+    segments: list[dict[str, Any]] = []
+    for block_index, block in enumerate(raw_blocks, start=1):
+        block_type = str(_value(block, "block_type", "paragraph"))
+        if block_type == "heading":
+            continue
+        content = str(_value(block, "content", "") or "").strip()
+        if not content:
+            continue
+        heading = _value(block, "heading", None) or parent_heading or None
+        provenance = {
+            "document_id": _value(block, "doc_id", ""),
+            "heading_index": _value(block, "heading_index", None),
+            "heading_text": heading,
+            "source_file": _value(block, "source_file", ""),
+            "source_line_ranges": [
+                {
+                    "start_line": _value(block, "source_start_line", None),
+                    "end_line": _value(block, "source_end_line", None),
+                }
+            ],
+            "source_block_id": _value(block, "block_id", ""),
+            "page_number": _value(block, "page_number", None),
+            "source_bbox": _value(block, "source_bbox", None),
+            "parent_heading": parent_heading,
+            "block_type": block_type,
+            "section_role": _value(block, "section_role", "content"),
+            "source_unit_id": _value(block, "source_unit_id", None),
+            "table_id": _value(block, "table_id", None),
+            "table_title": _value(block, "table_title", None),
+            "table_headers": _value(block, "table_headers", []) or [],
+            "table_row_index": _value(block, "table_row_index", None),
+            "record_id": _value(block, "record_id", None),
+        }
+        segments.extend(
+            _split_into_segments(
+                content,
+                heading,
+                provenance,
+                segment_prefix=f"seg{chunk_index:04d}b{block_index:04d}",
+            )
+        )
+    return segments
 
-    Returns list of merged batch dicts with provenance tracking.
-    Writes requirement_batches.jsonl to output.
-    """
-    batches = segment_chunks(chunks)
 
-    # Statistics
-    total_source_segments = sum(len(b["source_segments"]) for b in batches)
-    skip_batches = sum(1 for b in batches if b["skip_candidate"])
-    processed_batches = sum(1 for b in batches if not b["skip_candidate"])
-    total_merged_chars = sum(len(b["merged_text"]) for b in batches)
+def segment_chunks(
+    chunks: list[ChunkedBlock | Mapping[str, Any]],
+    *,
+    include_skipped: bool = False,
+) -> list[dict[str, Any]]:
+    """Segment chunks and return processable batches by default."""
+    all_segments: list[dict[str, Any]] = []
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        all_segments.extend(_chunk_segments(chunk, chunk_index))
 
-    batches_path = config.run_dir / "requirement_batches.jsonl"
-    with open(batches_path, "w", encoding="utf-8") as f:
-        for batch in batches:
-            f.write(json.dumps(batch, ensure_ascii=False) + "\n")
+    batches = _merge_short_segments(all_segments)
+    for index, batch in enumerate(batches, start=1):
+        batch["batch_id"] = f"batch_{index:04d}"
+    if include_skipped:
+        return batches
+    processable = [batch for batch in batches if not batch["skip_candidate"]]
+    for index, batch in enumerate(processable, start=1):
+        batch["batch_id"] = f"batch_{index:04d}"
+    return processable
 
-    print(f"[M4] {len(chunks)} chunks -> {total_source_segments} source segments -> {len(batches)} batches")
-    print(f"     -> {processed_batches} to process | {skip_batches} skip_candidate")
-    print(f"     -> avg merged size: {total_merged_chars // max(len(batches), 1)} chars")
+
+def run(config: PipelineConfig, chunks: list[ChunkedBlock | Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Execute M4 and write ``requirement_batches.jsonl``."""
+    config.prepare_run_dir()
+    all_batches = segment_chunks(chunks, include_skipped=True)
+    batches = [batch for batch in all_batches if not batch["skip_candidate"]]
+    skipped_batches = [batch for batch in all_batches if batch["skip_candidate"]]
+    for index, batch in enumerate(batches, start=1):
+        batch["batch_id"] = f"batch_{index:04d}"
+    total_segments = sum(len(batch["source_segments"]) for batch in all_batches)
+    total_chars = sum(len(batch["merged_text"]) for batch in batches)
+    batches_path = write_jsonl(config.run_dir / "requirement_batches.jsonl", batches)
+    write_jsonl(config.run_dir / "skipped_candidates.jsonl", skipped_batches)
+    print(f"[M4] {len(chunks)} chunks -> {total_segments} source segments -> {len(batches)} candidate batches")
+    print(f"     -> {len(batches)} to process | {len(skipped_batches)} skip_candidate")
+    print(f"     -> avg merged size: {total_chars // max(len(batches), 1)} chars")
     print(f"     -> {batches_path}")
     return batches

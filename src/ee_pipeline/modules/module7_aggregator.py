@@ -1,73 +1,95 @@
-"""M7: Aggregator — combines classification + translation into final spec records.
-
-Merges M5 (classification) and M6 (translation) results into unified SpecRecord objects.
-Preserves provenance tracking from source documents.
-"""
+"""M7: combine classification, translation, and source provenance."""
 
 from __future__ import annotations
 
-from pathlib import Path
+from collections import Counter
+from collections.abc import Mapping
 
 from ..config import PipelineConfig
+from ..io_utils import write_jsonl
 from ..models import ClassificationResult, SpecRecord, TranslationResult
+
+
+def _provenance_for(block_id: str, provenance_map: Mapping[str, Mapping]) -> Mapping:
+    """Resolve a batch or segment key without assuming one producer format."""
+    return provenance_map.get(block_id, {})
 
 
 def aggregate(
     classifications: list[ClassificationResult],
     translations: list[TranslationResult],
-    provenance_map: dict[str, dict] | None = None,
+    provenance_map: Mapping[str, Mapping] | None = None,
 ) -> list[SpecRecord]:
-    """Aggregate classification and translation results into spec records.
+    """Create final records for requirement + E/E classifications only."""
+    selected = [
+        classification
+        for classification in classifications
+        if classification.is_requirement and classification.is_ee_related
+    ]
+    duplicate_translation_ids = sorted(
+        block_id
+        for block_id, count in Counter(translation.block_id for translation in translations).items()
+        if count > 1
+    )
+    if duplicate_translation_ids:
+        sample = ", ".join(duplicate_translation_ids[:5])
+        raise ValueError(f"M7 received duplicate translation IDs: {sample}")
 
-    Only includes records where is_requirement=True AND is_ee_related=True.
+    translations_by_id = {translation.block_id: translation for translation in translations}
+    missing_translation_ids = sorted(
+        classification.block_id
+        for classification in selected
+        if classification.block_id not in translations_by_id
+    )
+    if missing_translation_ids:
+        sample = ", ".join(missing_translation_ids[:5])
+        raise ValueError(
+            f"M7 is missing translations for {len(missing_translation_ids)} E/E requirement(s): {sample}"
+        )
 
-    Args:
-        classifications: M5 output (one per batch).
-        translations: M6 output.
-        provenance_map: Optional mapping of segment_id to provenance info.
+    invalid_translation_ids = sorted(
+        classification.block_id
+        for classification in selected
+        if (
+            translations_by_id[classification.block_id].status != "OK"
+            or not translations_by_id[classification.block_id].translated_text.strip()
+        )
+    )
+    if invalid_translation_ids:
+        sample = ", ".join(invalid_translation_ids[:5])
+        raise ValueError(
+            f"M7 received unusable translations for {len(invalid_translation_ids)} E/E requirement(s): {sample}"
+        )
 
-    Returns:
-        List of SpecRecord objects with provenance tracking.
-    """
-    # Build translation lookup
-    translation_map: dict[str, TranslationResult] = {}
-    for t in translations:
-        translation_map[t.block_id] = t
-
-    # Build provenance lookup
-    provenance_map = provenance_map or {}
-
+    provenance = provenance_map or {}
     records: list[SpecRecord] = []
 
-    for cls in classifications:
-        # Only EE requirements (intersection of both axes)
-        if not (cls.is_requirement and cls.is_ee_related):
-            continue
-
-        translation = translation_map.get(cls.block_id)
-
-        # Try to find provenance from any source segment in the batch
-        # cls.block_id is the batch_id, look for source segments
-        provenance = provenance_map.get(cls.block_id, {})
-
-        records.append(SpecRecord(
-            doc_id=cls.doc_id,
-            block_id=cls.block_id,
-            heading=provenance.get("heading", ""),
-            english_text=cls.original_content,
-            korean_translation=translation.translated_text if translation else "",
-            is_requirement=cls.is_requirement,
-            is_ee_related=cls.is_ee_related,
-            ee_category=cls.ee_category.value if cls.ee_category else None,
-            matched_keywords=[],  # Will be filled by caller
-            source_file=provenance.get("source_file", ""),
-            page_number=provenance.get("page_number"),
-            # Provenance tracking
-            heading_index=provenance.get("heading_index"),
-            source_start_line=provenance.get("source_start_line"),
-            source_end_line=provenance.get("source_end_line"),
-        ))
-
+    for classification in selected:
+        source = _provenance_for(classification.block_id, provenance)
+        translation = translations_by_id[classification.block_id]
+        matched_keywords = source.get("matched_keywords", [])
+        records.append(
+            SpecRecord(
+                doc_id=classification.doc_id,
+                block_id=classification.block_id,
+                cur_id=classification.cur_id or source.get("cur_id") or classification.block_id,
+                heading=source.get("heading") or source.get("heading_text"),
+                english_text=classification.original_content,
+                korean_translation=translation.translated_text,
+                is_requirement=True,
+                is_ee_related=True,
+                ee_category=classification.ee_category.value if classification.ee_category else None,
+                notes=classification.reasoning,
+                matched_keywords=[str(keyword) for keyword in matched_keywords],
+                source_file=source.get("source_file", ""),
+                page_number=source.get("page_number"),
+                heading_index=source.get("heading_index"),
+                source_start_line=source.get("source_start_line"),
+                source_end_line=source.get("source_end_line"),
+                table_id=source.get("table_id"),
+                record_id=source.get("record_id"),
+            )
+        )
     return records
 
 
@@ -75,19 +97,11 @@ def run(
     config: PipelineConfig,
     classifications: list[ClassificationResult],
     translations: list[TranslationResult],
-    provenance_map: dict[str, dict] | None = None,
+    provenance_map: Mapping[str, Mapping] | None = None,
 ) -> list[SpecRecord]:
-    """Execute M7: aggregate results.
-
-    Returns list of SpecRecord objects with provenance tracking.
-    Writes spec_records.jsonl to output.
-    """
+    """Execute M7 and write ``spec_records.jsonl``."""
+    config.prepare_run_dir()
     records = aggregate(classifications, translations, provenance_map)
-
-    records_path = config.run_dir / "spec_records.jsonl"
-    with open(records_path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(r.model_dump_json() + "\n")
-
-    print(f"[M7] {len(records)} EE requirement records → {records_path}")
+    path = write_jsonl(config.run_dir / "spec_records.jsonl", records)
+    print(f"[M7] {len(records)} EE requirement records → {path}")
     return records

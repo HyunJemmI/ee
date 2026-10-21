@@ -1,2 +1,0 @@
-[console_scripts]
-ee-pipeline = ee_pipeline.cli:app

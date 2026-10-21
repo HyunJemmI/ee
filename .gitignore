@@ -1,0 +1,36 @@
+# User documents and generated artifacts
+/data/input/
+/data/keywords/input/
+/output*/
+
+# Local-only validation helpers and checkpoints
+/scripts/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python environments, caches, and build metadata
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+~$*

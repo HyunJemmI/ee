@@ -1,147 +1,126 @@
-"""M3: Contextual Chunker — groups blocks by heading hierarchy.
-
-Combines related blocks into contextual chunks based on heading structure.
-Creates proper context windows for LLM processing.
-"""
+"""M3: group parsed blocks into bounded, provenance-aware context chunks."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from ..config import PipelineConfig
+from ..io_utils import write_jsonl
 from ..models import ChunkedBlock, DocumentBlock
 
 
 def _build_heading_hierarchy(blocks: list[DocumentBlock]) -> str:
-    """Build a heading hierarchy string from blocks."""
-    headings = [b.heading for b in blocks if b.heading]
-    if not headings:
-        return ""
+    """Build a de-duplicated heading path for a chunk."""
+    headings: list[str] = []
+    for block in blocks:
+        heading = block.heading
+        if heading and heading not in headings:
+            headings.append(heading)
     return " > ".join(headings)
 
 
 def _group_by_heading(blocks: list[DocumentBlock]) -> list[list[DocumentBlock]]:
-    """Group blocks by their heading hierarchy.
-
-    Blocks with the same or parent heading are grouped together.
-    """
-    if not blocks:
-        return []
-
+    """Group adjacent blocks without crossing semantic or atomic boundaries."""
     groups: list[list[DocumentBlock]] = []
-    current_group: list[DocumentBlock] = []
-    current_top_heading: str | None = None
+    current: list[DocumentBlock] = []
+    current_doc_id: str | None = None
+    current_heading: str | None = None
+    current_source_unit_id: str | None = None
 
     for block in blocks:
-        if block.heading and block.heading_level <= 2:
-            # New top-level or section-level heading → start new group
-            if current_group:
-                groups.append(current_group)
-            current_group = [block]
-            current_top_heading = block.heading
-        else:
-            current_group.append(block)
+        starts_group = (
+            bool(current)
+            and (
+                block.doc_id != current_doc_id
+                or (block.heading is not None and block.heading != current_heading)
+                or (
+                    (block.source_unit_id is not None or current_source_unit_id is not None)
+                    and block.source_unit_id != current_source_unit_id
+                )
+            )
+        )
+        if starts_group:
+            groups.append(current)
+            current = []
+        current.append(block)
+        current_doc_id = block.doc_id
+        current_source_unit_id = block.source_unit_id
+        if block.heading:
+            current_heading = block.heading
 
-    if current_group:
-        groups.append(current_group)
-
+    if current:
+        groups.append(current)
     return groups
 
 
-def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> list[ChunkedBlock]:
-    """Chunk blocks into contextually meaningful groups.
+def _make_chunk(index: int, blocks: list[DocumentBlock]) -> ChunkedBlock:
+    """Create a chunk and its provenance arrays from a block sequence."""
+    content_parts = [
+        block.content
+        for block in blocks
+        if block.content and block.block_type != "heading"
+    ]
+    return ChunkedBlock(
+        chunk_id=f"chunk_{index:04d}",
+        blocks=blocks,
+        combined_content="\n\n".join(content_parts),
+        heading_hierarchy=_build_heading_hierarchy(blocks),
+        block_types=sorted({block.block_type for block in blocks}),
+        source_block_ids=[block.block_id for block in blocks],
+        source_unit_ids=list(
+            dict.fromkeys(block.source_unit_id for block in blocks if block.source_unit_id)
+        ),
+        source_heading_indices=[
+            block.heading_index for block in blocks if block.heading_index is not None
+        ],
+        source_line_ranges=[
+            {"start_line": block.source_start_line, "end_line": block.source_end_line}
+            for block in blocks
+            if block.source_start_line is not None
+        ],
+    )
 
-    Args:
-        blocks: List of document blocks to chunk.
-        max_chunk_size: Maximum characters per chunk.
 
-    Returns:
-        List of ChunkedBlock objects with provenance tracking.
-    """
-    groups = _group_by_heading(blocks)
+def _split_group(group: list[DocumentBlock], max_chunk_size: int, start_index: int) -> list[ChunkedBlock]:
+    """Split a heading group at block boundaries while respecting the size limit."""
     chunks: list[ChunkedBlock] = []
-    chunk_id_counter = 0
+    current: list[DocumentBlock] = []
+    current_size = 0
 
-    for group in groups:
-        combined = "\n\n".join(b.content for b in group if b.content)
-        hierarchy = _build_heading_hierarchy(group)
+    for block in group:
+        block_size = len(block.content)
+        separator_size = 2 if current else 0
+        would_exceed = current and current_size + separator_size + block_size > max_chunk_size
+        if would_exceed:
+            chunks.append(_make_chunk(start_index + len(chunks), current))
+            current = []
+            current_size = 0
+        current.append(block)
+        current_size += (2 if len(current) > 1 else 0) + block_size
 
-        # If combined content is too large, split by blocks
-        if len(combined) > max_chunk_size:
-            sub_blocks: list[DocumentBlock] = []
-            sub_content: list[str] = []
-            sub_hierarchy = hierarchy
-            sub_block_ids: list[str] = []
-            sub_heading_indices: list[int] = []
-            sub_line_ranges: list[dict] = []
-
-            for block in group:
-                block_text = block.content
-                if len("\n".join(sub_content)) + len(block_text) > max_chunk_size and sub_content:
-                    # Flush current sub-chunk
-                    chunk_id_counter += 1
-                    chunks.append(ChunkedBlock(
-                        chunk_id=f"chunk_{chunk_id_counter:04d}",
-                        blocks=sub_blocks,
-                        combined_content="\n".join(sub_content),
-                        heading_hierarchy=sub_hierarchy,
-                        source_block_ids=sub_block_ids,
-                        source_heading_indices=sub_heading_indices,
-                        source_line_ranges=sub_line_ranges,
-                    ))
-                    sub_blocks = [block]
-                    sub_content = [block_text]
-                    sub_block_ids = [block.block_id]
-                    sub_heading_indices = [block.heading_index] if block.heading_index is not None else []
-                    sub_line_ranges = [{"start_line": block.source_start_line, "end_line": block.source_end_line}] if block.source_start_line is not None else []
-                    sub_hierarchy = _build_heading_hierarchy([block])
-                else:
-                    sub_blocks.append(block)
-                    sub_content.append(block_text)
-                    sub_block_ids.append(block.block_id)
-                    if block.heading_index is not None:
-                        sub_heading_indices.append(block.heading_index)
-                    if block.source_start_line is not None:
-                        sub_line_ranges.append({"start_line": block.source_start_line, "end_line": block.source_end_line})
-
-            if sub_blocks:
-                chunk_id_counter += 1
-                chunks.append(ChunkedBlock(
-                    chunk_id=f"chunk_{chunk_id_counter:04d}",
-                    blocks=sub_blocks,
-                    combined_content="\n".join(sub_content),
-                    heading_hierarchy=sub_hierarchy,
-                    source_block_ids=sub_block_ids,
-                    source_heading_indices=sub_heading_indices,
-                    source_line_ranges=sub_line_ranges,
-                ))
-        else:
-            chunk_id_counter += 1
-            chunks.append(ChunkedBlock(
-                chunk_id=f"chunk_{chunk_id_counter:04d}",
-                blocks=group,
-                combined_content=combined,
-                heading_hierarchy=hierarchy,
-                source_block_ids=[b.block_id for b in group],
-                source_heading_indices=[b.heading_index for b in group if b.heading_index is not None],
-                source_line_ranges=[{"start_line": b.source_start_line, "end_line": b.source_end_line} for b in group if b.source_start_line is not None],
-            ))
-
+    if current:
+        chunks.append(_make_chunk(start_index + len(chunks), current))
     return chunks
 
 
-def run(config: PipelineConfig, blocks: list[DocumentBlock]) -> list[ChunkedBlock]:
-    """Execute M3: chunk blocks into contextual groups.
+def chunk_blocks(blocks: list[DocumentBlock], max_chunk_size: int = 4000) -> list[ChunkedBlock]:
+    """Chunk adjacent blocks into contextual groups.
 
-    Returns list of ChunkedBlock objects.
-    Writes structured_blocks.jsonl to output.
+    A single oversized block is kept intact so its original block identity and
+    provenance remain lossless; all multi-block chunks stay within the limit.
     """
+    if max_chunk_size <= 0:
+        raise ValueError("max_chunk_size must be positive")
+
+    usable_blocks = [block for block in blocks if block.block_type not in {"header", "footer"}]
+    chunks: list[ChunkedBlock] = []
+    for group in _group_by_heading(usable_blocks):
+        chunks.extend(_split_group(group, max_chunk_size, len(chunks) + 1))
+    return [chunk for chunk in chunks if chunk.combined_content.strip()]
+
+
+def run(config: PipelineConfig, blocks: list[DocumentBlock]) -> list[ChunkedBlock]:
+    """Execute M3 and write ``structured_blocks.jsonl``."""
+    config.prepare_run_dir()
     chunks = chunk_blocks(blocks)
-
-    chunks_path = config.run_dir / "structured_blocks.jsonl"
-    with open(chunks_path, "w", encoding="utf-8") as f:
-        for chunk in chunks:
-            f.write(chunk.model_dump_json() + "\n")
-
+    chunks_path = write_jsonl(config.run_dir / "structured_blocks.jsonl", chunks)
     print(f"[M3] {len(blocks)} blocks → {len(chunks)} chunks → {chunks_path}")
     return chunks

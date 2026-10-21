@@ -135,13 +135,13 @@
 | M5 분류 대상 (skip 제외) | 1,583 | 515 | **-67.5%** |
 | API 호출 수 (M5) | 1,583회 | 515회 | **-67.5%** |
 
-> **비용 개선:** API 호출 수 67.5% 감소 → ChatT API 비용 약 67.5% 절감
+> **비용 개선:** API 호출 수 67.5% 감소 → LLM API 비용 약 67.5% 절감
 
 ---
 
 ### 3.6 M5: AI Classifier (핵심 개선 모듈)
 
-**역할:** 2축 분류 (요구사항 여부 × 전장품 관련성) — ChatT API 활용
+**역할:** 2축 분류 (요구사항 여부 × 전장품 관련성) — ChatT 활용
 
 #### 최초 설계
 
@@ -155,10 +155,10 @@
 
 | 개선 항목 | 상세 |
 |-----------|------|
-| **병렬 처리** | asyncio + Semaphore 기반 bounded concurrency (max_concurrency=8) |
+| **병렬 처리** | asyncio + Semaphore 기반 bounded concurrency (기본 max_concurrency=4, 환경변수로 조정) |
 | **skip_candidate 사전 필터링** | M4에서 skip_candidate로 마크된 배치 자동 제외 |
 | **재시도 로직** | exponential backoff + jitter (최대 3회) |
-| **에러 처리** | API 실패 시 is_requirement=False, is_ee_related=False로 처리 |
+| **에러 처리** | 실패 ID를 수집한 뒤 실행을 중단하여 분류 분모가 조용히 오염되지 않도록 처리 |
 
 **개선 효과 (측정값 — timing_comparison_v2.py 기준, 20 세그먼트):**
 
@@ -243,5 +243,5 @@ graph LR
 - **테스트 데이터:** 18개 문서 (PDF, DOCX, PPTX, XLSX)
 - **M4 세그먼트 비교:** 20개 비-skip 세그먼트 샘플
 - **M5 시간 측정:** timing_comparison_v2.py (Old vs New 비교)
-- **API:** ChatT-VIBE (https://chat.hyundai-transys.com/)
-- **병렬 설정:** max_concurrency=8 (M5), concurrency=4 (M6)
+- **API:** OpenAI-compatible ChatT Chat Completions API
+- **병렬 설정:** M5·M6 공통 기본값 4 (`CHATT_MAX_CONCURRENCY`로 조정)
